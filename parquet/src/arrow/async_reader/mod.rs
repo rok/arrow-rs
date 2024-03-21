@@ -1076,6 +1076,7 @@ impl RowGroups for InMemoryRowGroup<'_> {
                     // filter out empty offset indexes (old versions specified Some(vec![]) when no present)
                     .filter(|index| !index.is_empty())
                     .map(|index| index[i].page_locations.clone());
+                // todo: provide crypto_context
                 let page_reader: Box<dyn PageReader> = Box::new(SerializedPageReader::new(
                     data.clone(),
                     self.metadata.column(i),
