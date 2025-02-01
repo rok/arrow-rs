@@ -1535,6 +1535,7 @@ mod tests {
         page::PageReader,
         reader::{get_column_reader, get_typed_column_reader, ColumnReaderImpl},
     };
+    use crate::encryption::encryption::FileEncryptionProperties;
     use crate::file::writer::TrackedWrite;
     use crate::file::{
         properties::ReaderProperties, reader::SerializedPageReader, writer::SerializedPageWriter,
@@ -2105,6 +2106,8 @@ mod tests {
             r.rows_written as usize,
             None,
             Arc::new(props),
+            #[cfg(feature = "encryption")]
+            None,
         )
         .unwrap();
 
@@ -2157,6 +2160,8 @@ mod tests {
             r.rows_written as usize,
             None,
             Arc::new(props),
+            #[cfg(feature = "encryption")]
+            None,
         )
         .unwrap();
 
@@ -2292,6 +2297,8 @@ mod tests {
                 r.rows_written as usize,
                 None,
                 Arc::new(props),
+                #[cfg(feature = "encryption")]
+                None,
             )
             .unwrap(),
         );
@@ -3373,6 +3380,31 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn test_encryption_writer() {
+        let message_type = "
+            message test_schema {
+                OPTIONAL BYTE_ARRAY a (UTF8);
+            }
+        ";
+        let schema = Arc::new(parse_message_type(message_type).unwrap());
+        let file: File = tempfile::tempfile().unwrap();
+
+        let builder = WriterProperties::builder();
+        let key_code: &[u8] = "0123456789012345".as_bytes();
+        let file_encryption_properties = FileEncryptionProperties::builder(key_code.to_vec())
+            .build()
+            .unwrap();
+
+        let props = Arc::new(
+            builder
+                .set_file_encryption_properties(file_encryption_properties)
+                .build(),
+        );
+        let mut writer = SerializedFileWriter::new(&file, schema, props).unwrap();
+    }
+
     #[test]
     fn test_increment_max_binary_chars() {
         let r = increment(vec![0xFF, 0xFE, 0xFD, 0xFF, 0xFF]);
@@ -3741,6 +3773,8 @@ mod tests {
                 result.rows_written as usize,
                 None,
                 Arc::new(props),
+                #[cfg(feature = "encryption")]
+                None,
             )
             .unwrap(),
         );

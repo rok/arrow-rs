@@ -115,11 +115,14 @@ impl RowGroups for InMemoryRowGroup {
             None => Err(ParquetError::General(format!(
                 "Invalid column index {i}, column was not fetched"
             ))),
+            // todo: provide crypto_context
             Some(data) => {
                 let page_reader: Box<dyn PageReader> = Box::new(SerializedPageReader::new(
                     data.clone(),
                     self.metadata.column(i),
                     self.num_rows(),
+                    None,
+                    #[cfg(feature = "encryption")]
                     None,
                 )?);
 

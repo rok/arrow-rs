@@ -146,14 +146,21 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
             let mut buf = [0_u8; FOOTER_SIZE];
             self.read_exact(&mut buf).await?;
 
-            let metadata_len = ParquetMetaDataReader::decode_footer(&buf)?;
+            let footer = ParquetMetaDataReader::decode_footer_tail(&buf)?;
+            let metadata_len = footer.metadata_length();
             self.seek(SeekFrom::End(-FOOTER_SIZE_I64 - metadata_len as i64))
                 .await?;
 
             let mut buf = Vec::with_capacity(metadata_len);
             self.take(metadata_len as _).read_to_end(&mut buf).await?;
 
-            Ok(Arc::new(ParquetMetaDataReader::decode_metadata(&buf)?))
+            // todo: provide file_decryption_properties
+            Ok(Arc::new(ParquetMetaDataReader::decode_metadata(
+                &buf,
+                footer.encrypted_footer(),
+                #[cfg(feature = "encryption")]
+                None,
+            )?))
         }
         .boxed()
     }
@@ -169,6 +176,9 @@ impl ArrowReaderMetadata {
     /// If `options` has [`ArrowReaderOptions::with_page_index`] true, but
     /// `Self::metadata` is missing the page index, this function will attempt
     /// to load the page index by making an object store request.
+
+    // load_async is what gets called by datafusion to read the metadata
+    // Rok, need your help here to add encryption.
     pub async fn load_async<T: AsyncFileReader>(
         input: &mut T,
         options: ArrowReaderOptions,
@@ -964,11 +974,14 @@ impl RowGroups for InMemoryRowGroup<'_> {
                     // filter out empty offset indexes (old versions specified Some(vec![]) when no present)
                     .filter(|index| !index.is_empty())
                     .map(|index| index[i].page_locations.clone());
+                // todo: provide crypto_context
                 let page_reader: Box<dyn PageReader> = Box::new(SerializedPageReader::new(
                     data.clone(),
                     self.metadata.column(i),
                     self.row_count,
                     page_locations,
+                    #[cfg(feature = "encryption")]
+                    None,
                 )?);
 
                 Ok(Box::new(ColumnChunkIterator {
