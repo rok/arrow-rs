@@ -303,6 +303,14 @@ impl ParquetMetaData {
     pub(crate) fn set_offset_index(&mut self, index: Option<ParquetOffsetIndex>) {
         self.offset_index = index;
     }
+
+
+    #[cfg(feature = "encryption")]
+    /// Set File decryptor
+    pub(crate) fn set_file_decryptor(&mut self, decryptor: Option<FileDecryptor>) {
+        self.file_decryptor = decryptor;
+    }
+
 }
 
 /// A builder for creating / manipulating [`ParquetMetaData`]
