@@ -73,6 +73,10 @@ use crate::encryption::decryption::CryptoContext;
 #[cfg(feature = "object_store")]
 pub use store::*;
 
+#[cfg(feature = "encryption")]
+use crate::encryption::decryption::{FileDecryptionProperties};
+use crate::encryption::decryption::FileDecryptor;
+
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 ///
 /// Notes:
