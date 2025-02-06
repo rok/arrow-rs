@@ -72,10 +72,6 @@ use crate::encryption::decryption::CryptoContext;
 #[cfg(feature = "object_store")]
 pub use store::*;
 
-#[cfg(feature = "encryption")]
-use crate::encryption::decryption::{FileDecryptionProperties};
-use crate::encryption::decryption::FileDecryptor;
-
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 ///
 /// Notes:
@@ -202,9 +198,6 @@ impl ArrowReaderMetadata {
     /// If `options` has [`ArrowReaderOptions::with_page_index`] true, but
     /// `Self::metadata` is missing the page index, this function will attempt
     /// to load the page index by making an object store request.
-
-    // load_async is what gets called by datafusion to read the metadata
-    // Rok, need your help here to add encryption.
     pub async fn load_async<T: AsyncFileReader>(
         input: &mut T,
         options: ArrowReaderOptions,
