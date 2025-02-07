@@ -178,11 +178,15 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
             let mut buf = Vec::with_capacity(metadata_len);
             self.take(metadata_len as _).read_to_end(&mut buf).await?;
 
+            #[cfg(feature = "encryption")]
+            let fd = None;
+            // let fd = file_decryption_properties.cloned();
+
             Ok(Arc::new(ParquetMetaDataReader::decode_metadata(
                 &buf,
                 footer.encrypted_footer(),
                 #[cfg(feature = "encryption")]
-                file_decryption_properties,
+                fd,
             )?))
         }
         .boxed()

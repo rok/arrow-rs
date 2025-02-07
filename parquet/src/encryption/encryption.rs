@@ -19,10 +19,10 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct FileEncryptionProperties {
-    encrypt_footer: bool,
-    footer_key: Vec<u8>,
-    column_keys: Option<HashMap<Vec<u8>, Vec<u8>>>,
-    aad_prefix: Option<Vec<u8>>,
+    pub encrypt_footer: bool,
+    pub footer_key: Vec<u8>,
+    pub column_keys: Option<HashMap<Vec<u8>, Vec<u8>>>,
+    pub aad_prefix: Option<Vec<u8>>,
 }
 
 impl FileEncryptionProperties {
