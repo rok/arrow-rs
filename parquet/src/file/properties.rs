@@ -289,6 +289,11 @@ impl WriterProperties {
         self.statistics_truncate_length
     }
 
+    // Return the encryption properties
+    pub fn file_encryption_properties(&self) -> Option<&FileEncryptionProperties> {
+        self.file_encryption_properties.as_ref()
+    }
+
     /// Returns `true` if type coercion is enabled.
     pub fn coerce_types(&self) -> bool {
         self.coerce_types
@@ -372,6 +377,7 @@ impl WriterProperties {
             .and_then(|c| c.bloom_filter_properties())
             .or_else(|| self.default_column_properties.bloom_filter_properties())
     }
+
 }
 
 /// Builder for  [`WriterProperties`] parquet writer configuration.
