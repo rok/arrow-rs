@@ -21,6 +21,7 @@ use crate::errors::Result;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
+use crate::encryption::modules::{create_module_aad, ModuleType};
 
 pub fn read_and_decrypt<T: Read>(
     decryptor: &Arc<dyn BlockDecryptor>,
