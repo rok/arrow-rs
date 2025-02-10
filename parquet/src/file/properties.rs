@@ -23,6 +23,7 @@ use crate::format::SortingColumn;
 use crate::schema::types::ColumnPath;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
+use crate::encryption::encryption::FileEncryptionProperties;
 
 /// Default value for [`WriterProperties::data_page_size_limit`]
 pub const DEFAULT_PAGE_SIZE: usize = 1024 * 1024;
@@ -169,6 +170,7 @@ pub struct WriterProperties {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
+    file_encryption_properties: Option<FileEncryptionProperties>,
 }
 
 impl Default for WriterProperties {
@@ -287,6 +289,11 @@ impl WriterProperties {
         self.statistics_truncate_length
     }
 
+    // Return the encryption properties
+    pub fn file_encryption_properties(&self) -> Option<&FileEncryptionProperties> {
+        self.file_encryption_properties.as_ref()
+    }
+
     /// Returns `true` if type coercion is enabled.
     pub fn coerce_types(&self) -> bool {
         self.coerce_types
@@ -370,6 +377,7 @@ impl WriterProperties {
             .and_then(|c| c.bloom_filter_properties())
             .or_else(|| self.default_column_properties.bloom_filter_properties())
     }
+
 }
 
 /// Builder for  [`WriterProperties`] parquet writer configuration.
@@ -392,6 +400,7 @@ pub struct WriterPropertiesBuilder {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
+    file_encryption_properties: Option<FileEncryptionProperties>,
 }
 
 impl WriterPropertiesBuilder {
@@ -414,6 +423,7 @@ impl WriterPropertiesBuilder {
             column_index_truncate_length: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             statistics_truncate_length: DEFAULT_STATISTICS_TRUNCATE_LENGTH,
             coerce_types: DEFAULT_COERCE_TYPES,
+            file_encryption_properties: None,
         }
     }
 
@@ -436,6 +446,7 @@ impl WriterPropertiesBuilder {
             column_index_truncate_length: self.column_index_truncate_length,
             statistics_truncate_length: self.statistics_truncate_length,
             coerce_types: self.coerce_types,
+            file_encryption_properties: self.file_encryption_properties,
         }
     }
 
@@ -806,6 +817,16 @@ impl WriterPropertiesBuilder {
     /// [`ArrowToParquetSchemaConverter::with_coerce_types`]: crate::arrow::ArrowSchemaConverter::with_coerce_types
     pub fn set_coerce_types(mut self, coerce_types: bool) -> Self {
         self.coerce_types = coerce_types;
+        self
+    }
+
+    /// Sets FileEncryptionProperties.
+    /// Only applicable if file encryption is enabled.
+    pub fn set_file_encryption_properties(
+        mut self,
+        file_encryption_properties: FileEncryptionProperties,
+    ) -> Self {
+        self.file_encryption_properties = Some(file_encryption_properties);
         self
     }
 }
