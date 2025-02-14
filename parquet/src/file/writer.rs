@@ -155,6 +155,7 @@ pub struct SerializedFileWriter<W: Write> {
     // kv_metadatas will be appended to `props` when `write_metadata`
     kv_metadatas: Vec<KeyValue>,
     finished: bool,
+    file_encryptor: FileEncryptor,
 }
 
 impl<W: Write> Debug for SerializedFileWriter<W> {
@@ -173,12 +174,19 @@ impl<W: Write + Send> SerializedFileWriter<W> {
     /// Creates new file writer.
     pub fn new(buf: W, schema: TypePtr, properties: WriterPropertiesPtr) -> Result<Self> {
         let mut buf = TrackedWrite::new(buf);
-        Self::start_file(&mut buf)?;
+        if properties.file_encryption_properties().is_some() {
+            // todo: check if all columns in properties.file_encryption_properties().column_keys
+            // are present in the schema
+            let fep = properties.file_encryption_properties().unwrap();
+            Self::start_encrypted_file(&mut buf)?;
+        } else {
+            Self::start_file(&mut buf)?;
+        }
         Ok(Self {
             buf,
             schema: schema.clone(),
             descr: Arc::new(SchemaDescriptor::new(schema)),
-            props: properties,
+            props: properties.clone(),
             row_groups: vec![],
             bloom_filters: vec![],
             column_indexes: Vec::new(),
@@ -186,6 +194,8 @@ impl<W: Write + Send> SerializedFileWriter<W> {
             row_group_index: 0,
             kv_metadatas: Vec::new(),
             finished: false,
+            #[cfg(feature = "encryption")]
+            file_encryptor: FileEncryptor::new(properties.file_encryption_properties().unwrap().clone(), vec![], vec![])
         })
     }
 
@@ -270,6 +280,11 @@ impl<W: Write + Send> SerializedFileWriter<W> {
 
     /// Writes magic bytes at the beginning of the file.
     fn start_file(buf: &mut TrackedWrite<W>) -> Result<()> {
+        buf.write_all(&PARQUET_MAGIC)?;
+        Ok(())
+    }
+
+    fn start_encrypted_file(buf: &mut TrackedWrite<W>) -> Result<()> {
         buf.write_all(&PARQUET_MAGIC)?;
         Ok(())
     }
