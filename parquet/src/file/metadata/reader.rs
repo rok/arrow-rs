@@ -831,6 +831,9 @@ fn get_file_decryptor(
                 .ok_or_else(|| general_err!("AAD unique file identifier is not set"))?;
             let aad_prefix: Vec<u8> = algo.aad_prefix.unwrap_or_default();
 
+            if file_decryption_properties.footer_key.len() != 16 {
+                return Err(general_err!("The footer key size must be 16 bytes in the file decryption properies."));
+            }
             Ok(FileDecryptor::new(
                 file_decryption_properties,
                 aad_file_unique,

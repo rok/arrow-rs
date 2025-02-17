@@ -107,9 +107,9 @@ impl CryptoContext {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileDecryptionProperties {
-    footer_key: Vec<u8>,
-    column_keys: Option<HashMap<Vec<u8>, Vec<u8>>>,
-    aad_prefix: Option<Vec<u8>>,
+    pub footer_key: Vec<u8>,
+    pub column_keys: Option<HashMap<Vec<u8>, Vec<u8>>>,
+    pub aad_prefix: Option<Vec<u8>>,
 }
 
 impl FileDecryptionProperties {
