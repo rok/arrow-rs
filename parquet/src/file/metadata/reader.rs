@@ -34,7 +34,7 @@ use crate::file::reader::ChunkReader;
 use crate::file::{FOOTER_SIZE, PARQUET_MAGIC, PARQUET_MAGIC_ENCR_FOOTER};
 use crate::format::{ColumnOrder as TColumnOrder, FileMetaData as TFileMetaData};
 #[cfg(feature = "encryption")]
-use crate::format::{EncryptionAlgorithm, FileCryptoMetaData as TFileCryptoMetaData};
+use crate::format::{EncryptionAlgorithm, FileCryptoMetaData as TFileCryptoMetaData, AesGcmV1};
 use crate::schema::types;
 use crate::schema::types::SchemaDescriptor;
 use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
@@ -752,10 +752,14 @@ impl ParquetMetaDataReader {
         let schema_descr = Arc::new(SchemaDescriptor::new(schema));
 
         #[cfg(feature = "encryption")]
-        if let (Some(algo), Some(file_decryption_properties)) = (
-            t_file_metadata.encryption_algorithm,
-            file_decryption_properties,
-        ) {
+        if let Some(file_decryption_properties) =
+            file_decryption_properties
+        {
+            let algo = match t_file_metadata.encryption_algorithm {
+                Some(ea) => ea,
+                None => EncryptionAlgorithm::AESGCMV1(
+                    AesGcmV1{aad_prefix: file_decryption_properties.aad_prefix.clone(), aad_file_unique: None, supply_aad_prefix: None}),
+            };
             // File has a plaintext footer but encryption algorithm is set
             file_decryptor = Some(get_file_decryptor(algo, file_decryption_properties)?);
         }
@@ -830,7 +834,8 @@ fn get_file_decryptor(
         EncryptionAlgorithm::AESGCMV1(algo) => {
             let aad_file_unique = algo
                 .aad_file_unique
-                .ok_or_else(|| general_err!("AAD unique file identifier is not set"))?;
+                .unwrap_or_default();
+                // .ok_or_else(|| general_err!("AAD unique file identifier is not set"))?;
             let aad_prefix: Vec<u8> = algo.aad_prefix.unwrap_or_default();
 
             Ok(FileDecryptor::new(
