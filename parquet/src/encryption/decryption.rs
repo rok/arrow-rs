@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::encryption::ciphers::{BlockDecryptor, RingGcmBlockDecryptor};
+use crate::encryption::modules::{create_module_aad, ModuleType};
 use crate::errors::Result;
 use std::collections::HashMap;
 use std::io::Read;
@@ -80,6 +81,38 @@ impl CryptoContext {
         }
     }
 
+    pub(crate) fn create_page_header_aad(&self) -> Result<Vec<u8>> {
+        let module_type = if self.dictionary_page {
+            ModuleType::DictionaryPageHeader
+        } else {
+            ModuleType::DataPageHeader
+        };
+
+        create_module_aad(
+            self.file_aad(),
+            module_type,
+            self.row_group_ordinal,
+            self.column_ordinal,
+            self.page_ordinal,
+        )
+    }
+
+    pub(crate) fn create_page_aad(&self) -> Result<Vec<u8>> {
+        let module_type = if self.dictionary_page {
+            ModuleType::DictionaryPage
+        } else {
+            ModuleType::DataPage
+        };
+
+        create_module_aad(
+            self.file_aad(),
+            module_type,
+            self.row_group_ordinal,
+            self.column_ordinal,
+            self.page_ordinal,
+        )
+    }
+
     pub fn for_dictionary_page(&self) -> Self {
         Self {
             row_group_ordinal: self.row_group_ordinal,
@@ -105,6 +138,7 @@ impl CryptoContext {
     }
 }
 
+/// FileDecryptionProperties hold keys and AAD data required to decrypt a Parquet file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileDecryptionProperties {
     pub footer_key: Vec<u8>,
@@ -113,6 +147,7 @@ pub struct FileDecryptionProperties {
 }
 
 impl FileDecryptionProperties {
+    /// Returns a new FileDecryptionProperties builder
     pub fn builder(footer_key: Vec<u8>) -> DecryptionPropertiesBuilder {
         DecryptionPropertiesBuilder::new(footer_key)
     }
@@ -154,9 +189,9 @@ impl DecryptionPropertiesBuilder {
         self
     }
 
-    pub fn with_column_key(mut self, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn with_column_key(mut self, column_name: Vec<u8>, decryption_key: Vec<u8>) -> Self {
         let mut column_keys = self.column_keys.unwrap_or_default();
-        column_keys.insert(key, value);
+        column_keys.insert(column_name, decryption_key);
         self.column_keys = Some(column_keys);
         self
     }

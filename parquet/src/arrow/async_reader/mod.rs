@@ -68,6 +68,7 @@ use crate::encryption::decryption::FileDecryptionProperties;
 mod store;
 
 use crate::arrow::schema::ParquetField;
+#[cfg(feature = "encryption")]
 use crate::encryption::decryption::CryptoContext;
 #[cfg(feature = "object_store")]
 pub use store::*;
@@ -107,7 +108,6 @@ pub trait AsyncFileReader: Send {
     /// Provides asynchronous access to the [`ParquetMetaData`] of a parquet file,
     /// allowing fine-grained control over how metadata is sourced, in particular allowing
     /// for caching, pre-fetching, catalog metadata, etc...
-    /// If data is encrypted, the [`FileDecryptionProperties`] should be provided.
     fn get_metadata<'a>(
         &'a mut self,
         #[cfg(feature = "encryption")] file_decryption_properties: Option<
@@ -177,15 +177,11 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
             let mut buf = Vec::with_capacity(metadata_len);
             self.take(metadata_len as _).read_to_end(&mut buf).await?;
 
-            #[cfg(feature = "encryption")]
-            let fd = None;
-            // let fd = file_decryption_properties.cloned();
-
             Ok(Arc::new(ParquetMetaDataReader::decode_metadata(
                 &buf,
-                footer.encrypted_footer(),
+                footer.is_encrypted_footer(),
                 #[cfg(feature = "encryption")]
-                fd,
+                file_decryption_properties,
             )?))
         }
         .boxed()
@@ -214,15 +210,9 @@ impl ArrowReaderMetadata {
         let mut metadata = input
             .get_metadata(
                 #[cfg(feature = "encryption")]
-                file_decryption_properties,
+                options.file_decryption_properties.as_ref(),
             )
             .await?;
-
-        #[cfg(feature = "encryption")]
-        let use_encryption = file_decryption_properties.is_some();
-
-        #[cfg(not(feature = "encryption"))]
-        let use_encryption = false;
 
         if options.page_index
             && metadata.column_index().is_none()
@@ -231,8 +221,10 @@ impl ArrowReaderMetadata {
             let m = Arc::try_unwrap(metadata).unwrap_or_else(|e| e.as_ref().clone());
             let mut reader = ParquetMetaDataReader::new_with_metadata(m).with_page_indexes(true);
 
-            if use_encryption {
-                reader = reader.with_decryption_properties(file_decryption_properties);
+            #[cfg(feature = "encryption")]
+            {
+                reader =
+                    reader.with_decryption_properties(options.file_decryption_properties.as_ref());
             }
 
             reader.load_page_index(input).await?;
@@ -253,8 +245,7 @@ pub struct AsyncReader<T>(T);
 ///
 /// This builder  handles reading the parquet file metadata, allowing consumers
 /// to use this information to select what specific columns, row groups, etc...
-/// they wish to be read by the resulting stream. If footer or columns are encrypted
-/// [`FileDecryptionProperties`] should be provided.
+/// they wish to be read by the resulting stream.
 ///
 /// See examples on [`ParquetRecordBatchStreamBuilder::new`]
 ///
@@ -402,22 +393,10 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         .await
     }
 
-    /// Create a new [`ParquetRecordBatchStreamBuilder`] with the provided async source,
-    /// [`ArrowReaderOptions`] and [`FileDecryptionProperties`] if the data is encrypted.
-    pub async fn new_with_options(
-        mut input: T,
-        options: ArrowReaderOptions,
-        #[cfg(feature = "encryption")] file_decryption_properties: Option<
-            &FileDecryptionProperties,
-        >,
-    ) -> Result<Self> {
-        let metadata = ArrowReaderMetadata::load_async(
-            &mut input,
-            options,
-            #[cfg(feature = "encryption")]
-            file_decryption_properties,
-        )
-        .await?;
+    /// Create a new [`ParquetRecordBatchStreamBuilder`] with the provided async source
+    /// and [`ArrowReaderOptions`].
+    pub async fn new_with_options(mut input: T, options: ArrowReaderOptions) -> Result<Self> {
+        let metadata = ArrowReaderMetadata::load_async(&mut input, options).await?;
         Ok(Self::new_with_metadata(input, metadata))
     }
 
@@ -642,7 +621,7 @@ where
             #[cfg(feature = "encryption")]
             row_group_ordinal: row_group_idx,
             #[cfg(feature = "encryption")]
-            parquet_metadata: Some(self.metadata.clone()),
+            parquet_metadata: self.metadata.clone(),
         };
 
         if let Some(filter) = self.filter.as_mut() {
@@ -931,7 +910,7 @@ struct InMemoryRowGroup<'a> {
     #[cfg(feature = "encryption")]
     row_group_ordinal: usize,
     #[cfg(feature = "encryption")]
-    parquet_metadata: Option<Arc<ParquetMetaData>>,
+    parquet_metadata: Arc<ParquetMetaData>,
 }
 
 impl InMemoryRowGroup<'_> {
@@ -1034,41 +1013,35 @@ impl RowGroups for InMemoryRowGroup<'_> {
 
     fn column_chunks(&self, i: usize) -> Result<Box<dyn PageIterator>> {
         #[cfg(feature = "encryption")]
-        let crypto_context = if let Some(file_decryptor) = &self
-            .parquet_metadata
-            .clone()
-            .unwrap()
-            .file_decryptor()
-            .clone()
-        {
-            let column_name = &self
-                .parquet_metadata
-                .clone()
-                .unwrap()
-                .file_metadata()
-                .schema_descr()
-                .column(i);
+        let crypto_context =
+            if let Some(file_decryptor) = &self.parquet_metadata.clone().file_decryptor().clone() {
+                let column_name = &self
+                    .parquet_metadata
+                    .clone()
+                    .file_metadata()
+                    .schema_descr()
+                    .column(i);
 
-            if file_decryptor.is_column_encrypted(column_name.name().as_bytes()) {
-                let data_decryptor =
-                    file_decryptor.get_column_data_decryptor(column_name.name().as_bytes());
-                let metadata_decryptor =
-                    file_decryptor.get_column_metadata_decryptor(column_name.name().as_bytes());
+                if file_decryptor.is_column_encrypted(column_name.name().as_bytes()) {
+                    let data_decryptor =
+                        file_decryptor.get_column_data_decryptor(column_name.name().as_bytes());
+                    let metadata_decryptor =
+                        file_decryptor.get_column_metadata_decryptor(column_name.name().as_bytes());
 
-                let crypto_context = CryptoContext::new(
-                    self.row_group_ordinal,
-                    i,
-                    data_decryptor,
-                    metadata_decryptor,
-                    file_decryptor.file_aad().clone(),
-                );
-                Some(Arc::new(crypto_context))
+                    let crypto_context = CryptoContext::new(
+                        self.row_group_ordinal,
+                        i,
+                        data_decryptor,
+                        metadata_decryptor,
+                        file_decryptor.file_aad().clone(),
+                    );
+                    Some(Arc::new(crypto_context))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         match &self.column_chunks[i] {
             None => Err(ParquetError::General(format!(
@@ -2495,22 +2468,15 @@ mod tests {
         file: &mut File,
         decryption_properties: FileDecryptionProperties,
     ) {
-        let decryption_properties = Some(decryption_properties);
+        let options =
+            ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties);
 
-        let metadata = ArrowReaderMetadata::load_async(
-            file,
-            Default::default(),
-            decryption_properties.as_ref(),
-        )
-        .await
-        .unwrap();
-        let arrow_reader_metadata = ArrowReaderMetadata::load_async(
-            file,
-            Default::default(),
-            decryption_properties.as_ref(),
-        )
-        .await
-        .unwrap();
+        let metadata = ArrowReaderMetadata::load_async(file, options.clone())
+            .await
+            .unwrap();
+        let arrow_reader_metadata = ArrowReaderMetadata::load_async(file, options)
+            .await
+            .unwrap();
         let file_metadata = metadata.metadata.file_metadata();
 
         let record_reader = ParquetRecordBatchStreamBuilder::new_with_metadata(
@@ -2614,14 +2580,9 @@ mod tests {
         let path = format!("{testdata}/encrypt_columns_plaintext_footer.parquet.encrypted");
         let mut file = File::open(&path).await.unwrap();
 
-        let metadata = ArrowReaderMetadata::load_async(
-            &mut file,
-            Default::default(),
-            #[cfg(feature = "encryption")]
-            None,
-        )
-        .await
-        .unwrap();
+        let metadata = ArrowReaderMetadata::load_async(&mut file, Default::default())
+            .await
+            .unwrap();
         let file_metadata = metadata.metadata.file_metadata();
 
         assert_eq!(file_metadata.num_rows(), 50);
@@ -2725,13 +2686,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let decryption_properties = Some(decryption_properties);
-        let metadata = ArrowReaderMetadata::load_async(
-            &mut file,
-            Default::default(),
-            decryption_properties.as_ref(),
-        )
-        .await;
+        let options =
+            ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties);
+        let metadata = ArrowReaderMetadata::load_async(&mut file, options).await;
 
         match metadata {
             Err(ParquetError::NYI(s)) => {

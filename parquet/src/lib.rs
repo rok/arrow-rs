@@ -142,7 +142,7 @@ experimental!(mod encodings);
 pub mod bloom_filter;
 
 #[cfg(feature = "encryption")]
-experimental!(pub mod encryption);
+experimental!(mod encryption);
 
 pub mod file;
 pub mod record;

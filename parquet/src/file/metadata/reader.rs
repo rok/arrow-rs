@@ -95,7 +95,7 @@ impl FooterTail {
     }
 
     /// Whether the footer metadata is encrypted
-    pub fn encrypted_footer(&self) -> bool {
+    pub fn is_encrypted_footer(&self) -> bool {
         self.encrypted_footer
     }
 }
@@ -156,7 +156,7 @@ impl ParquetMetaDataReader {
         self
     }
 
-    /// Provide the [`FileDecryptionProperties`] to use when decrypting the file.
+    /// Provide the FileDecryptionProperties to use when decrypting the file.
     ///
     /// This is only necessary when the file is encrypted.
     #[cfg(feature = "encryption")]
@@ -460,7 +460,9 @@ impl ParquetMetaDataReader {
         let bytes = match &remainder {
             Some((remainder_start, remainder)) if *remainder_start <= range.start => {
                 let offset = range.start - *remainder_start;
-                remainder.slice(offset..range.end - *remainder_start + offset)
+                let end = offset + range.end - range.start;
+                assert!(end <= remainder.len());
+                remainder.slice(offset..end)
             }
             // Note: this will potentially fetch data already in remainder, this keeps things simple
             _ => fetch.fetch(range.start..range.end).await?,
@@ -568,7 +570,7 @@ impl ParquetMetaDataReader {
         let start = file_size - footer_metadata_len as u64;
         Self::decode_metadata(
             chunk_reader.get_bytes(start, metadata_len)?.as_ref(),
-            footer.encrypted_footer(),
+            footer.is_encrypted_footer(),
             #[cfg(feature = "encryption")]
             self.file_decryption_properties.as_ref(),
         )
@@ -637,7 +639,7 @@ impl ParquetMetaDataReader {
             Ok((
                 Self::decode_metadata(
                     &meta,
-                    footer.encrypted_footer(),
+                    footer.is_encrypted_footer(),
                     #[cfg(feature = "encryption")]
                     file_decryption_properties,
                 )?,
@@ -649,7 +651,7 @@ impl ParquetMetaDataReader {
             Ok((
                 Self::decode_metadata(
                     slice,
-                    footer.encrypted_footer(),
+                    footer.is_encrypted_footer(),
                     #[cfg(feature = "encryption")]
                     file_decryption_properties,
                 )?,
@@ -831,9 +833,6 @@ fn get_file_decryptor(
                 .ok_or_else(|| general_err!("AAD unique file identifier is not set"))?;
             let aad_prefix: Vec<u8> = algo.aad_prefix.unwrap_or_default();
 
-            if file_decryption_properties.footer_key.len() != 16 {
-                return Err(general_err!("The footer key size must be 16 bytes in the file decryption properies."));
-            }
             Ok(FileDecryptor::new(
                 file_decryption_properties,
                 aad_file_unique,
@@ -1220,6 +1219,42 @@ mod async_tests {
         let metadata = ParquetMetaDataReader::new()
             .with_page_indexes(true)
             .with_prefetch_hint(Some(130650))
+            .load_and_finish(f, len)
+            .await
+            .unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
+
+        // Prefetch more than enough but less than the entire file
+        fetch_count.store(0, Ordering::SeqCst);
+        let f = MetadataFetchFn(&mut fetch);
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .with_prefetch_hint(Some(len - 1000)) // prefetch entire file
+            .load_and_finish(f, len)
+            .await
+            .unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
+
+        // Prefetch the entire file
+        fetch_count.store(0, Ordering::SeqCst);
+        let f = MetadataFetchFn(&mut fetch);
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .with_prefetch_hint(Some(len)) // prefetch entire file
+            .load_and_finish(f, len)
+            .await
+            .unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(metadata.offset_index().is_some() && metadata.column_index().is_some());
+
+        // Prefetch more than the entire file
+        fetch_count.store(0, Ordering::SeqCst);
+        let f = MetadataFetchFn(&mut fetch);
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .with_prefetch_hint(Some(len + 1000)) // prefetch entire file
             .load_and_finish(f, len)
             .await
             .unwrap();
