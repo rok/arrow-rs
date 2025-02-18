@@ -550,23 +550,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
     /// Create a new [`ParquetRecordBatchReaderBuilder`] with [`ArrowReaderOptions`]
     pub fn try_new_with_options(reader: T, options: ArrowReaderOptions) -> Result<Self> {
-        let metadata = ArrowReaderMetadata::load(
-            &reader,
-            options,
-            #[cfg(feature = "encryption")]
-            None,
-        )?;
-        Ok(Self::new_with_metadata(reader, metadata))
-    }
-
-    /// Create a new [`ParquetRecordBatchReaderBuilder`] with [`ArrowReaderOptions`] and [`FileDecryptionProperties`]
-    #[cfg(feature = "encryption")]
-    pub fn try_new_with_decryption(
-        reader: T,
-        options: ArrowReaderOptions,
-        file_decryption_properties: Option<&FileDecryptionProperties>,
-    ) -> Result<Self> {
-        let metadata = ArrowReaderMetadata::load(&reader, options, file_decryption_properties)?;
+        let metadata = ArrowReaderMetadata::load(&reader, options)?;
         Ok(Self::new_with_metadata(reader, metadata))
     }
 
@@ -600,7 +584,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
     /// # writer.close().unwrap();
     /// # let file = Bytes::from(file);
     /// #
-    /// let metadata = ArrowReaderMetadata::load(&file, Default::default(), None).unwrap();
+    /// let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
     /// let mut a = ParquetRecordBatchReaderBuilder::new_with_metadata(file.clone(), metadata.clone()).build().unwrap();
     /// let mut b = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata).build().unwrap();
     ///
@@ -861,24 +845,6 @@ impl ParquetRecordBatchReader {
         ParquetRecordBatchReaderBuilder::try_new(reader)?
             .with_batch_size(batch_size)
             .build()
-    }
-
-    /// Create a new [`ParquetRecordBatchReader`] from the provided chunk reader and [`FileDecryptionProperties`]
-    ///
-    /// Note: this is needed when the parquet file is encrypted
-    #[cfg(feature = "encryption")]
-    pub fn try_new_with_decryption<T: ChunkReader + 'static>(
-        reader: T,
-        batch_size: usize,
-        file_decryption_properties: Option<&FileDecryptionProperties>,
-    ) -> Result<Self> {
-        ParquetRecordBatchReaderBuilder::try_new_with_decryption(
-            reader,
-            Default::default(),
-            file_decryption_properties,
-        )?
-        .with_batch_size(batch_size)
-        .build()
     }
 
     /// Create a new [`ParquetRecordBatchReader`] from the provided [`RowGroups`]

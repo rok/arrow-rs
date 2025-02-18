@@ -23,6 +23,7 @@ use crate::format::SortingColumn;
 use crate::schema::types::ColumnPath;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
+#[cfg(feature = "encryption")]
 use crate::encryption::encryption::FileEncryptionProperties;
 
 /// Default value for [`WriterProperties::data_page_size_limit`]
@@ -170,6 +171,7 @@ pub struct WriterProperties {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
+    #[cfg(feature = "encryption")]
     file_encryption_properties: Option<FileEncryptionProperties>,
 }
 
@@ -290,6 +292,7 @@ impl WriterProperties {
     }
 
     // Return the encryption properties
+    #[cfg(feature = "encryption")]
     pub fn file_encryption_properties(&self) -> Option<&FileEncryptionProperties> {
         self.file_encryption_properties.as_ref()
     }
@@ -400,6 +403,7 @@ pub struct WriterPropertiesBuilder {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
+    #[cfg(feature = "encryption")]
     file_encryption_properties: Option<FileEncryptionProperties>,
 }
 
@@ -423,6 +427,7 @@ impl WriterPropertiesBuilder {
             column_index_truncate_length: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             statistics_truncate_length: DEFAULT_STATISTICS_TRUNCATE_LENGTH,
             coerce_types: DEFAULT_COERCE_TYPES,
+            #[cfg(feature = "encryption")]
             file_encryption_properties: None,
         }
     }
@@ -446,6 +451,7 @@ impl WriterPropertiesBuilder {
             column_index_truncate_length: self.column_index_truncate_length,
             statistics_truncate_length: self.statistics_truncate_length,
             coerce_types: self.coerce_types,
+            #[cfg(feature = "encryption")]
             file_encryption_properties: self.file_encryption_properties,
         }
     }
@@ -822,6 +828,7 @@ impl WriterPropertiesBuilder {
 
     /// Sets FileEncryptionProperties.
     /// Only applicable if file encryption is enabled.
+    #[cfg(feature = "encryption")]
     pub fn set_file_encryption_properties(
         mut self,
         file_encryption_properties: FileEncryptionProperties,

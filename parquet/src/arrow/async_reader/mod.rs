@@ -201,9 +201,6 @@ impl ArrowReaderMetadata {
     pub async fn load_async<T: AsyncFileReader>(
         input: &mut T,
         options: ArrowReaderOptions,
-        #[cfg(feature = "encryption")] file_decryption_properties: Option<
-            &FileDecryptionProperties,
-        >,
     ) -> Result<Self> {
         // TODO: this is all rather awkward. It would be nice if AsyncFileReader::get_metadata
         // took an argument to fetch the page indexes.
@@ -387,8 +384,6 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         Self::new_with_options(
             input,
             Default::default(),
-            #[cfg(feature = "encryption")]
-            None,
         )
         .await
     }
