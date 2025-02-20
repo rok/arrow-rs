@@ -752,14 +752,10 @@ impl ParquetMetaDataReader {
         let schema_descr = Arc::new(SchemaDescriptor::new(schema));
 
         #[cfg(feature = "encryption")]
-        if let Some(file_decryption_properties) =
-            file_decryption_properties
-        {
-            let algo = match t_file_metadata.encryption_algorithm {
-                Some(ea) => ea,
-                None => EncryptionAlgorithm::AESGCMV1(
-                    AesGcmV1{aad_prefix: file_decryption_properties.aad_prefix.clone(), aad_file_unique: None, supply_aad_prefix: None}),
-            };
+        if let (Some(algo), Some(file_decryption_properties)) = (
+            t_file_metadata.encryption_algorithm,
+            file_decryption_properties,
+        ) {
             // File has a plaintext footer but encryption algorithm is set
             file_decryptor = Some(get_file_decryptor(algo, file_decryption_properties)?);
         }
