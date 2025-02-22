@@ -733,11 +733,13 @@ impl ParquetMetaDataReader {
                     t_file_crypto_metadata.encryption_algorithm,
                     file_decryption_properties,
                 )?;
-                let footer_decryptor = decryptor.get_footer_decryptor();
+                let footer_decryptor = decryptor.get_footer_decryptor()?;
                 let aad_footer = create_footer_aad(decryptor.file_aad())?;
 
                 decrypted_fmd_buf =
-                    footer_decryptor.decrypt(prot.as_slice().as_ref(), aad_footer.as_ref())?;
+                    footer_decryptor.decrypt(prot.as_slice().as_ref(), aad_footer.as_ref()).map_err(|e| {
+                        general_err!("Provided footer key was unable to decrypt parquet footer")
+                    })?;
                 prot = TCompactSliceInputProtocol::new(decrypted_fmd_buf.as_ref());
 
                 file_decryptor = Some(decryptor);
@@ -838,7 +840,7 @@ fn get_file_decryptor(
                 file_decryption_properties,
                 aad_file_unique,
                 aad_prefix,
-            ))
+            )?)
         }
         EncryptionAlgorithm::AESGCMCTRV1(_) => Err(nyi_err!(
             "The AES_GCM_CTR_V1 encryption algorithm is not yet supported"

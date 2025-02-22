@@ -1019,9 +1019,9 @@ impl RowGroups for InMemoryRowGroup<'_> {
 
                 if file_decryptor.is_column_encrypted(column_name.name().as_bytes()) {
                     let data_decryptor =
-                        file_decryptor.get_column_data_decryptor(column_name.name().as_bytes());
+                        file_decryptor.get_column_data_decryptor(column_name.name().as_bytes()).expect("Invalid column data decryptor");
                     let metadata_decryptor =
-                        file_decryptor.get_column_metadata_decryptor(column_name.name().as_bytes());
+                        file_decryptor.get_column_metadata_decryptor(column_name.name().as_bytes()).expect("Invalid column metadata decryptor");
 
                     let crypto_context = CryptoContext::new(
                         self.row_group_ordinal,
@@ -1163,6 +1163,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempfile;
     use tokio::fs::File;
+    use crate::data_type::AsBytes;
 
     #[derive(Clone)]
     struct TestReader {
@@ -1332,8 +1333,6 @@ mod tests {
         let builder = ParquetRecordBatchStreamBuilder::new_with_options(
             async_reader,
             options,
-            #[cfg(feature = "encryption")]
-            None,
         )
         .await
         .unwrap();
@@ -1451,8 +1450,6 @@ mod tests {
         let builder = ParquetRecordBatchStreamBuilder::new_with_options(
             async_reader,
             options,
-            #[cfg(feature = "encryption")]
-            None,
         )
         .await
         .unwrap();
@@ -1539,8 +1536,6 @@ mod tests {
             let builder = ParquetRecordBatchStreamBuilder::new_with_options(
                 async_reader,
                 options,
-                #[cfg(feature = "encryption")]
-                None,
             )
             .await
             .unwrap();
@@ -1615,8 +1610,6 @@ mod tests {
         let builder = ParquetRecordBatchStreamBuilder::new_with_options(
             async_reader,
             options,
-            #[cfg(feature = "encryption")]
-            None,
         )
         .await
         .unwrap();
@@ -1854,8 +1847,6 @@ mod tests {
         let stream = ParquetRecordBatchStreamBuilder::new_with_options(
             async_reader,
             options,
-            #[cfg(feature = "encryption")]
-            None,
         )
         .await
         .unwrap()
@@ -2248,8 +2239,6 @@ mod tests {
             let mut reader = ParquetRecordBatchStreamBuilder::new_with_options(
                 tokio::fs::File::from_std(file.try_clone().unwrap()),
                 ArrowReaderOptions::new().with_page_index(true),
-                #[cfg(feature = "encryption")]
-                None,
             )
             .await
             .unwrap();
@@ -2462,25 +2451,22 @@ mod tests {
     async fn verify_encryption_test_file_read(
         file: &mut File,
         decryption_properties: FileDecryptionProperties,
-    ) {
+    ) -> Result<(), ParquetError> {
         let options =
             ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties);
 
         let metadata = ArrowReaderMetadata::load_async(file, options.clone())
-            .await
-            .unwrap();
+            .await?;
         let arrow_reader_metadata = ArrowReaderMetadata::load_async(file, options)
-            .await
-            .unwrap();
+            .await?;
         let file_metadata = metadata.metadata.file_metadata();
 
         let record_reader = ParquetRecordBatchStreamBuilder::new_with_metadata(
-            file.try_clone().await.unwrap(),
+            file.try_clone().await?,
             arrow_reader_metadata.clone(),
         )
-        .build()
-        .unwrap();
-        let record_batches = record_reader.try_collect::<Vec<_>>().await.unwrap();
+        .build()?;
+        let record_batches = record_reader.try_collect::<Vec<_>>().await?;
 
         assert_eq!(file_metadata.num_rows(), 50);
         assert_eq!(file_metadata.schema_descr().num_columns(), 8);
@@ -2545,6 +2531,7 @@ mod tests {
         }
 
         assert_eq!(row_count, file_metadata.num_rows() as usize);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2567,6 +2554,74 @@ mod tests {
             .unwrap();
 
         verify_encryption_test_file_read(&mut file, decryption_properties).await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "encryption")]
+    async fn test_misspecified_encryption_keys() {
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/encrypt_columns_and_footer.parquet.encrypted");
+
+        // There is always a footer key even with a plaintext footer,
+        // but this is used for signing the footer.
+        let footer_key = "0123456789012345".as_bytes(); // 128bit/16
+        let column_1_key = "1234567890123450".as_bytes();
+        let column_2_key = "1234567890123451".as_bytes();
+
+        // read file with keys and check for expected error message
+        async fn check_for_error(expected_message: &str, path: &String, footer_key: &[u8], column_1_key: &[u8], column_2_key: &[u8])
+        {
+            let mut file = File::open(&path).await.unwrap();
+
+            let mut decryption_properties = FileDecryptionProperties::builder(footer_key.to_vec());
+
+            if column_1_key.len() > 0 {
+                decryption_properties = decryption_properties.with_column_key("double_field".as_bytes().to_vec(), column_1_key.to_vec());
+            }
+
+            if column_2_key.len() > 0 {
+                decryption_properties = decryption_properties.with_column_key("float_field".as_bytes().to_vec(), column_2_key.to_vec());
+            }
+
+            let decryption_properties = decryption_properties.build().unwrap();
+
+
+            match verify_encryption_test_file_read(&mut file, decryption_properties).await {
+                Ok(res) => {
+                    // println!("{:?} success", res);
+                    assert!(false, "did not get expected error")
+                },
+                Err(e) => {
+                    // println!("{:?} error", e.to_string());
+                    assert_eq!(e.to_string(), expected_message);
+                },
+            }
+        }
+
+        // Too short footer key
+        check_for_error("Parquet error: Invalid footer key. Invalid key length",
+                        &path, "bad_pwd".as_bytes(), column_1_key, column_2_key).await;
+
+        // Wrong footer key
+        check_for_error("Parquet error: Provided footer key was unable to decrypt parquet footer",
+                        &path, "1123456789012345".as_bytes(), column_1_key, column_2_key).await;
+
+
+        // Missing column key
+        check_for_error("Parquet error: Unable to decrypt column 'double_field', perhaps the column key is wrong or missing?",
+                        &path, footer_key, "".as_bytes(), column_2_key).await;
+
+        // Too short column key
+        check_for_error("Parquet error: Invalid key length",
+                        &path, footer_key, "abc".as_bytes(), column_2_key).await;
+
+        // Wrong column key
+        check_for_error("Parquet error: Unable to decrypt column 'double_field', perhaps the column key is wrong or missing?",
+                        &path, footer_key, "1123456789012345".as_bytes(), column_2_key).await;
+
+        // Mixed up keys
+        check_for_error("Parquet error: Unable to decrypt column 'float_field', perhaps the column key is wrong or missing?",
+                        &path, footer_key, column_2_key, column_1_key).await;
     }
 
     #[tokio::test]
