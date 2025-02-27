@@ -1017,7 +1017,7 @@ mod tests {
     };
     #[cfg(feature = "encryption")]
     use crate::encryption::decryption::FileDecryptionProperties;
-    use crate::errors::Result;
+    use crate::errors::{ParquetError, Result};
     use crate::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
     use crate::file::writer::SerializedFileWriter;
     use crate::schema::parser::parse_message_type;
@@ -1869,7 +1869,75 @@ mod tests {
             .build()
             .unwrap();
 
-        verify_encryption_test_file_read(file, decryption_properties);
+        verify_encryption_test_file_read(file, decryption_properties).expect("failed to decrypt file");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_misspecified_encryption_keys() {
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/encrypt_columns_and_footer.parquet.encrypted");
+
+        // There is always a footer key even with a plaintext footer,
+        // but this is used for signing the footer.
+        let footer_key = "0123456789012345".as_bytes(); // 128bit/16
+        let column_1_key = "1234567890123450".as_bytes();
+        let column_2_key = "1234567890123451".as_bytes();
+
+        // read file with keys and check for expected error message
+        fn check_for_error(expected_message: &str, path: &String, footer_key: &[u8], column_1_key: &[u8], column_2_key: &[u8])
+        {
+            let file = File::open(&path).unwrap();
+
+            let mut decryption_properties = FileDecryptionProperties::builder(footer_key.to_vec());
+
+            if column_1_key.len() > 0 {
+                decryption_properties = decryption_properties.with_column_key("double_field".as_bytes().to_vec(), column_1_key.to_vec());
+            }
+
+            if column_2_key.len() > 0 {
+                decryption_properties = decryption_properties.with_column_key("float_field".as_bytes().to_vec(), column_2_key.to_vec());
+            }
+
+            let decryption_properties = decryption_properties.build().unwrap();
+
+
+            match verify_encryption_test_file_read(file, decryption_properties){
+                Ok(_) => {
+                    // println!("{:?} success", res);
+                    assert!(false, "did not get expected error")
+                },
+                Err(e) => {
+                    // println!("{:?} error", e.to_string());
+                    assert_eq!(e.to_string(), expected_message);
+                },
+            }
+        }
+
+        // Too short footer key
+        check_for_error("Parquet error: Invalid footer key. Invalid key length",
+                        &path, "bad_pwd".as_bytes(), column_1_key, column_2_key);
+
+        // Wrong footer key
+        check_for_error("Parquet error: Provided footer key was unable to decrypt parquet footer",
+                        &path, "1123456789012345".as_bytes(), column_1_key, column_2_key);
+
+
+        // Missing column key
+        check_for_error("Parquet error: Unable to decrypt column 'double_field', perhaps the column key is wrong or missing?",
+                        &path, footer_key, "".as_bytes(), column_2_key);
+
+        // Too short column key
+        check_for_error("Parquet error: Invalid key length",
+                        &path, footer_key, "abc".as_bytes(), column_2_key);
+
+        // Wrong column key
+        check_for_error("Parquet error: Unable to decrypt column 'double_field', perhaps the column key is wrong or missing?",
+                        &path, footer_key, "1123456789012345".as_bytes(), column_2_key);
+
+        // Mixed up keys
+        check_for_error("Parquet error: Unable to decrypt column 'float_field', perhaps the column key is wrong or missing?",
+                        &path, footer_key, column_2_key, column_1_key);
     }
 
     #[test]
@@ -1946,7 +2014,7 @@ mod tests {
             .build()
             .unwrap();
 
-        verify_encryption_test_file_read(file, decryption_properties);
+        verify_encryption_test_file_read(file, decryption_properties).expect("failed to decrypt file");
     }
 
     #[test]
@@ -1961,7 +2029,7 @@ mod tests {
             .build()
             .unwrap();
 
-        verify_encryption_test_file_read(file, decryption_properties);
+        verify_encryption_test_file_read(file, decryption_properties).expect("failed to decrypt file");
     }
 
     #[test]
@@ -1999,14 +2067,14 @@ mod tests {
     fn verify_encryption_test_file_read(
         file: File,
         decryption_properties: FileDecryptionProperties,
-    ) {
+    ) -> Result<(), ParquetError> {
         let options = ArrowReaderOptions::default()
             .with_file_decryption_properties(decryption_properties.clone());
-        let metadata = ArrowReaderMetadata::load(&file, options.clone()).unwrap();
+        let metadata = ArrowReaderMetadata::load(&file, options.clone())?;
         let file_metadata = metadata.metadata.file_metadata();
 
         let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
-        let record_reader = builder.build().unwrap();
+        let record_reader = builder.build()?;
 
         assert_eq!(file_metadata.num_rows(), 50);
         assert_eq!(file_metadata.schema_descr().num_columns(), 8);
@@ -2022,7 +2090,7 @@ mod tests {
 
         let mut row_count = 0;
         for batch in record_reader {
-            let batch = batch.unwrap();
+            let batch = batch?;
             row_count += batch.num_rows();
 
             let bool_col = batch.column(0).as_boolean();
@@ -2072,6 +2140,7 @@ mod tests {
         }
 
         assert_eq!(row_count, file_metadata.num_rows() as usize);
+        Ok(())
     }
 
     #[test]

@@ -737,7 +737,7 @@ impl ParquetMetaDataReader {
                 let aad_footer = create_footer_aad(decryptor.file_aad())?;
 
                 decrypted_fmd_buf =
-                    footer_decryptor.decrypt(prot.as_slice().as_ref(), aad_footer.as_ref()).map_err(|e| {
+                    footer_decryptor.decrypt(prot.as_slice().as_ref(), aad_footer.as_ref()).map_err(|_| {
                         general_err!("Provided footer key was unable to decrypt parquet footer")
                     })?;
                 prot = TCompactSliceInputProtocol::new(decrypted_fmd_buf.as_ref());

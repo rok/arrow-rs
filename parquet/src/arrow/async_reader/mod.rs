@@ -1163,7 +1163,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempfile;
     use tokio::fs::File;
-    use crate::data_type::AsBytes;
 
     #[derive(Clone)]
     struct TestReader {
@@ -2553,7 +2552,7 @@ mod tests {
             .build()
             .unwrap();
 
-        verify_encryption_test_file_read(&mut file, decryption_properties).await;
+        verify_encryption_test_file_read(&mut file, decryption_properties).await.expect("failed to decrypt file");
     }
 
     #[tokio::test]
@@ -2587,7 +2586,7 @@ mod tests {
 
 
             match verify_encryption_test_file_read(&mut file, decryption_properties).await {
-                Ok(res) => {
+                Ok(_) => {
                     // println!("{:?} success", res);
                     assert!(false, "did not get expected error")
                 },
@@ -2701,7 +2700,7 @@ mod tests {
             .build()
             .unwrap();
 
-        verify_encryption_test_file_read(&mut file, decryption_properties).await;
+        verify_encryption_test_file_read(&mut file, decryption_properties).await.expect("failed to decrypt file");
     }
 
     #[tokio::test]
@@ -2716,7 +2715,7 @@ mod tests {
             .build()
             .unwrap();
 
-        verify_encryption_test_file_read(&mut file, decryption_properties).await;
+        verify_encryption_test_file_read(&mut file, decryption_properties).await.expect("failed to decrypt file");
     }
 
     #[tokio::test]
