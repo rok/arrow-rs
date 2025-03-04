@@ -20,5 +20,5 @@
 
 pub mod ciphers;
 pub mod decryption;
-pub mod encryption;
+pub mod encrypt;
 pub mod modules;
