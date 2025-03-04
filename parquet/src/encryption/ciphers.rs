@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use ring::aead::{Aad, LessSafeKey, NonceSequence, UnboundKey, AES_128_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::fmt::Debug;
@@ -47,6 +47,24 @@ impl RingGcmBlockDecryptor {
 
 impl BlockDecryptor for RingGcmBlockDecryptor {
     fn decrypt(&self, length_and_ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        if length_and_ciphertext.len() < SIZE_LEN {
+            return Err(general_err!(
+                "Ciphertext buffer size {} must be at least {}",
+                length_and_ciphertext.len(),
+                SIZE_LEN
+            ));
+        }
+        let mut len_bytes = [0; 4];
+        len_bytes.copy_from_slice(&length_and_ciphertext[0..SIZE_LEN]);
+        let ciphertext_len = u32::from_le_bytes(len_bytes) as usize;
+        if length_and_ciphertext.len() != SIZE_LEN + ciphertext_len {
+            return Err(general_err!(
+                "Ciphertext buffer size {} does not match expected size {}",
+                length_and_ciphertext.len(),
+                SIZE_LEN + ciphertext_len
+            ));
+        }
+
         let mut result =
             Vec::with_capacity(length_and_ciphertext.len() - SIZE_LEN - NONCE_LEN - TAG_LEN);
         result.extend_from_slice(&length_and_ciphertext[SIZE_LEN + NONCE_LEN..]);
