@@ -1225,7 +1225,7 @@ impl ColumnChunkMetaData {
         let crypto_metadata = self
             .column_crypto_metadata
             .as_ref()
-            .map(|c| column_crypto_metadata::to_thrift(c));
+            .map(column_crypto_metadata::to_thrift);
         #[cfg(not(feature = "encryption"))]
         let crypto_metadata = None;
 
