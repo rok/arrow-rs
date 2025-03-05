@@ -18,8 +18,8 @@
 //! Encryption implementation specific to Parquet, as described
 //! in the [spec](https://github.com/apache/parquet-format/blob/master/Encryption.md).
 
-pub mod ciphers;
+pub(crate) mod ciphers;
 pub mod decryption;
 pub mod encrypt;
-pub mod modules;
+pub(crate) mod modules;
 pub(crate) mod page_encryptor;
