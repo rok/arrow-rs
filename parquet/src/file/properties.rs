@@ -19,7 +19,7 @@
 use crate::basic::{Compression, Encoding};
 use crate::compression::{CodecOptions, CodecOptionsBuilder};
 #[cfg(feature = "encryption")]
-use crate::encryption::encryption::FileEncryptionProperties;
+use crate::encryption::encrypt::FileEncryptionProperties;
 use crate::file::metadata::KeyValue;
 use crate::format::SortingColumn;
 use crate::schema::types::ColumnPath;
@@ -380,7 +380,6 @@ impl WriterProperties {
             .and_then(|c| c.bloom_filter_properties())
             .or_else(|| self.default_column_properties.bloom_filter_properties())
     }
-
 }
 
 /// Builder for  [`WriterProperties`] parquet writer configuration.

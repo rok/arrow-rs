@@ -1022,6 +1022,8 @@ mod tests {
     use crate::file::writer::SerializedFileWriter;
     use crate::schema::parser::parse_message_type;
     use crate::schema::types::{Type, TypePtr};
+    #[cfg(feature = "encryption")]
+    use crate::util::test_common::encryption_util::verify_encryption_test_file_read;
     use crate::util::test_common::rand_gen::RandGen;
 
     #[test]

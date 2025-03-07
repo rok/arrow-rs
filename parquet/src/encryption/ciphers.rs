@@ -51,6 +51,24 @@ impl RingGcmBlockDecryptor {
 
 impl BlockDecryptor for RingGcmBlockDecryptor {
     fn decrypt(&self, length_and_ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        if length_and_ciphertext.len() < SIZE_LEN {
+            return Err(general_err!(
+                "Ciphertext buffer size {} must be at least {}",
+                length_and_ciphertext.len(),
+                SIZE_LEN
+            ));
+        }
+        let mut len_bytes = [0; 4];
+        len_bytes.copy_from_slice(&length_and_ciphertext[0..SIZE_LEN]);
+        let ciphertext_len = u32::from_le_bytes(len_bytes) as usize;
+        if length_and_ciphertext.len() != SIZE_LEN + ciphertext_len {
+            return Err(general_err!(
+                "Ciphertext buffer size {} does not match expected size {}",
+                length_and_ciphertext.len(),
+                SIZE_LEN + ciphertext_len
+            ));
+        }
+
         let mut result =
             Vec::with_capacity(length_and_ciphertext.len() - SIZE_LEN - NONCE_LEN - TAG_LEN);
         result.extend_from_slice(&length_and_ciphertext[SIZE_LEN + NONCE_LEN..]);
@@ -68,7 +86,7 @@ impl BlockDecryptor for RingGcmBlockDecryptor {
 }
 
 pub trait BlockEncryptor: Debug + Send + Sync {
-    fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Vec<u8>;
+    fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
 }
 
 #[derive(Debug, Clone)]
@@ -78,19 +96,19 @@ struct CounterNonce {
 }
 
 impl CounterNonce {
-    pub fn new(rng: &SystemRandom) -> Self {
+    pub fn new(rng: &SystemRandom) -> Result<Self> {
         let mut buf = [0; 16];
-        rng.fill(&mut buf).unwrap();
+        rng.fill(&mut buf)?;
 
-        // Since this is a random seed value, endianess doesn't matter at all,
+        // Since this is a random seed value, endianness doesn't matter at all,
         // and we can use whatever is platform-native.
         let start = u128::from_ne_bytes(buf) & RIGHT_TWELVE;
         let counter = start.wrapping_add(1);
 
-        Self { start, counter }
+        Ok(Self { start, counter })
     }
 
-    /// One accessor for the nonce bytes to avoid potentially flipping endianess
+    /// One accessor for the nonce bytes to avoid potentially flipping endianness
     #[inline]
     pub fn get_bytes(&self) -> [u8; NONCE_LEN] {
         self.counter.to_le_bytes()[0..NONCE_LEN].try_into().unwrap()
@@ -118,28 +136,67 @@ pub(crate) struct RingGcmBlockEncryptor {
 }
 
 impl RingGcmBlockEncryptor {
-    // todo TBD: some KMS systems produce data keys, need to be able to pass them to Encryptor.
-    // todo TBD: for other KMSs, we will create data keys inside arrow-rs, making sure to use SystemRandom
     /// Create a new `RingGcmBlockEncryptor` with a given key and random nonce.
     /// The nonce will advance appropriately with each block encryption and
     /// return an error if it wraps around.
-    pub(crate) fn new(key_bytes: &[u8]) -> Self {
+    pub(crate) fn new(key_bytes: &[u8]) -> Result<Self> {
         let rng = SystemRandom::new();
 
         // todo support other key sizes
-        let key = UnboundKey::new(&AES_128_GCM, key_bytes.as_ref()).unwrap();
-        let nonce = CounterNonce::new(&rng);
+        let key = UnboundKey::new(&AES_128_GCM, key_bytes)
+            .map_err(|e| general_err!("Error creating AES key: {}", e))?;
+        let nonce = CounterNonce::new(&rng)?;
 
-        Self {
+        Ok(Self {
             key: LessSafeKey::new(key),
             nonce_sequence: nonce,
-        }
+        })
     }
 }
 
 impl BlockEncryptor for RingGcmBlockEncryptor {
-    fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
-        todo!()
+    fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        // Create encrypted buffer.
+        // Format is: [ciphertext size, nonce, ciphertext, authentication tag]
+        let ciphertext_length = NONCE_LEN + plaintext.len() + TAG_LEN;
+        let mut ciphertext = Vec::with_capacity(SIZE_LEN + ciphertext_length);
+        ciphertext.extend((ciphertext_length as u32).to_le_bytes());
+
+        let nonce = self.nonce_sequence.advance()?;
+        ciphertext.extend(nonce.as_ref());
+        ciphertext.extend(plaintext);
+
+        let tag = self.key.seal_in_place_separate_tag(
+            nonce,
+            Aad::from(aad),
+            &mut ciphertext[SIZE_LEN + NONCE_LEN..],
+        )?;
+
+        ciphertext.extend(tag.as_ref());
+
+        debug_assert_eq!(SIZE_LEN + ciphertext_length, ciphertext.len());
+
+        Ok(ciphertext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_round_trip() {
+        let key = [0u8; 16];
+        let mut encryptor = RingGcmBlockEncryptor::new(&key).unwrap();
+        let decryptor = RingGcmBlockDecryptor::new(&key);
+
+        let plaintext = b"hello, world!";
+        let aad = b"some aad";
+
+        let ciphertext = encryptor.encrypt(plaintext, aad).unwrap();
+        let decrypted = decryptor.decrypt(&ciphertext, aad).unwrap();
+
+        assert_eq!(plaintext, decrypted.as_slice());
     }
 }
 
