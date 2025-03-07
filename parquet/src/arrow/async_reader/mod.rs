@@ -424,7 +424,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
     /// // open file with parquet data
     /// let mut file = tokio::fs::File::from_std(file);
     /// // load metadata once
-    /// let meta = ArrowReaderMetadata::load_async(&mut file, Default::default(), #[cfg(feature = "encryption")] None).await.unwrap();
+    /// let meta = ArrowReaderMetadata::load_async(&mut file, Default::default()).await.unwrap();
     /// // create two readers, a and b, from the same underlying file
     /// // without reading the metadata again
     /// let mut a = ParquetRecordBatchStreamBuilder::new_with_metadata(

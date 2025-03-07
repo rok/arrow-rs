@@ -558,6 +558,8 @@ impl<'a, W: Write + Send> SerializedRowGroupWriter<'a, W> {
         ) -> Result<C>,
     {
         self.assert_previous_writer_closed()?;
+        // Not implemented yet
+        /*
         #[cfg(feature = "encryption")]
         let file_encryptor = FileEncryptor::new(
             self.props
@@ -567,6 +569,7 @@ impl<'a, W: Write + Send> SerializedRowGroupWriter<'a, W> {
                 .clone(),
             vec![],
         );
+        */
 
         Ok(match self.next_column_desc() {
             Some(column) => {
