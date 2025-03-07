@@ -152,7 +152,7 @@ mod tests {
     fn test_round_trip() {
         let key = [0u8; 16];
         let mut encryptor = RingGcmBlockEncryptor::new(&key);
-        let decryptor = RingGcmBlockDecryptor::new(&key);
+        let decryptor = RingGcmBlockDecryptor::new(&key).unwrap();
 
         let plaintext = b"hello, world!";
         let aad = b"some aad";
