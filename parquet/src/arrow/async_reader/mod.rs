@@ -1019,9 +1019,9 @@ impl RowGroups for InMemoryRowGroup<'_> {
 
                 if file_decryptor.is_column_encrypted(column_name.name().as_bytes()) {
                     let data_decryptor =
-                        file_decryptor.get_column_data_decryptor(column_name.name().as_bytes()).expect("Invalid column data decryptor");
+                        file_decryptor.get_column_data_decryptor(column_name.name().as_bytes());
                     let metadata_decryptor =
-                        file_decryptor.get_column_metadata_decryptor(column_name.name().as_bytes()).expect("Invalid column metadata decryptor");
+                        file_decryptor.get_column_metadata_decryptor(column_name.name().as_bytes());
 
                     let crypto_context = CryptoContext::new(
                         self.row_group_ordinal,

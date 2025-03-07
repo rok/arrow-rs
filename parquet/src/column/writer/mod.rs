@@ -419,6 +419,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             data_page_boundary_ascending: true,
             data_page_boundary_descending: true,
             last_non_null_data_page_min_max: None,
+            // metadata_encryptor: metadata_encryptor,
+            // data_encryptor: data_encryptor,
         }
     }
 
@@ -1535,6 +1537,7 @@ mod tests {
         page::PageReader,
         reader::{get_column_reader, get_typed_column_reader, ColumnReaderImpl},
     };
+    #[cfg(feature = "encryption")]
     use crate::encryption::encryption::FileEncryptionProperties;
     use crate::file::writer::TrackedWrite;
     use crate::file::{
@@ -3399,10 +3402,11 @@ mod tests {
 
         let props = Arc::new(
             builder
-                .set_file_encryption_properties(file_encryption_properties)
+                .with_file_encryption_properties(file_encryption_properties)
                 .build(),
         );
-        let mut writer = SerializedFileWriter::new(&file, schema, props).unwrap();
+        let mut _writer = SerializedFileWriter::new(&file, schema, props).unwrap();
+        todo!()
     }
 
     #[test]

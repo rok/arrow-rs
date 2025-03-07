@@ -33,6 +33,8 @@ use crate::column::{
     writer::{get_column_writer, ColumnWriter},
 };
 use crate::data_type::DataType;
+#[cfg(feature = "encryption")]
+use crate::encryption::encryption::FileEncryptor;
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{BloomFilterPosition, WriterPropertiesPtr};
 use crate::file::reader::ChunkReader;
@@ -153,6 +155,8 @@ pub struct SerializedFileWriter<W: Write> {
     // kv_metadatas will be appended to `props` when `write_metadata`
     kv_metadatas: Vec<KeyValue>,
     finished: bool,
+    #[cfg(feature = "encryption")]
+    file_encryptor: Option<FileEncryptor>,
 }
 
 impl<W: Write> Debug for SerializedFileWriter<W> {
@@ -171,12 +175,36 @@ impl<W: Write + Send> SerializedFileWriter<W> {
     /// Creates new file writer.
     pub fn new(buf: W, schema: TypePtr, properties: WriterPropertiesPtr) -> Result<Self> {
         let mut buf = TrackedWrite::new(buf);
+        #[cfg(feature = "encryption")]
+        let file_encryptor = if properties.file_encryption_properties.is_some() {
+            Some(FileEncryptor::new(
+                properties
+                    .file_encryption_properties
+                    .as_ref()
+                    .unwrap()
+                    .clone(),
+                vec![],
+            ))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "encryption")]
+        if properties.file_encryption_properties.is_some() {
+            // todo: check if all columns in properties.file_encryption_properties.column_keys
+            // are present in the schema
+            let _fep = properties.file_encryption_properties.clone().unwrap();
+            Self::start_encrypted_file(&mut buf)?;
+        } else {
+            Self::start_file(&mut buf)?;
+        }
+        #[cfg(not(feature = "encryption"))]
         Self::start_file(&mut buf)?;
         Ok(Self {
             buf,
             schema: schema.clone(),
             descr: Arc::new(SchemaDescriptor::new(schema)),
-            props: properties,
+            props: properties.clone(),
             row_groups: vec![],
             bloom_filters: vec![],
             column_indexes: Vec::new(),
@@ -184,6 +212,8 @@ impl<W: Write + Send> SerializedFileWriter<W> {
             row_group_index: 0,
             kv_metadatas: Vec::new(),
             finished: false,
+            #[cfg(feature = "encryption")]
+            file_encryptor,
         })
     }
 
@@ -268,6 +298,11 @@ impl<W: Write + Send> SerializedFileWriter<W> {
 
     /// Writes magic bytes at the beginning of the file.
     fn start_file(buf: &mut TrackedWrite<W>) -> Result<()> {
+        buf.write_all(&PARQUET_MAGIC)?;
+        Ok(())
+    }
+
+    fn start_encrypted_file(buf: &mut TrackedWrite<W>) -> Result<()> {
         buf.write_all(&PARQUET_MAGIC)?;
         Ok(())
     }
@@ -523,6 +558,16 @@ impl<'a, W: Write + Send> SerializedRowGroupWriter<'a, W> {
         ) -> Result<C>,
     {
         self.assert_previous_writer_closed()?;
+        #[cfg(feature = "encryption")]
+        let file_encryptor = FileEncryptor::new(
+            self.props
+                .file_encryption_properties
+                .as_ref()
+                .unwrap()
+                .clone(),
+            vec![],
+        );
+
         Ok(match self.next_column_desc() {
             Some(column) => {
                 let props = self.props.clone();

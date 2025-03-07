@@ -18,6 +18,8 @@
 //! Configuration via [`WriterProperties`] and [`ReaderProperties`]
 use crate::basic::{Compression, Encoding};
 use crate::compression::{CodecOptions, CodecOptionsBuilder};
+#[cfg(feature = "encryption")]
+use crate::encryption::encryption::FileEncryptionProperties;
 use crate::file::metadata::KeyValue;
 use crate::format::SortingColumn;
 use crate::schema::types::ColumnPath;
@@ -172,7 +174,7 @@ pub struct WriterProperties {
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
     #[cfg(feature = "encryption")]
-    file_encryption_properties: Option<FileEncryptionProperties>,
+    pub(crate) file_encryption_properties: Option<FileEncryptionProperties>,
 }
 
 impl Default for WriterProperties {
@@ -827,9 +829,8 @@ impl WriterPropertiesBuilder {
     }
 
     /// Sets FileEncryptionProperties.
-    /// Only applicable if file encryption is enabled.
     #[cfg(feature = "encryption")]
-    pub fn set_file_encryption_properties(
+    pub fn with_file_encryption_properties(
         mut self,
         file_encryption_properties: FileEncryptionProperties,
     ) -> Self {

@@ -16,13 +16,15 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use crate::encryption::ciphers::{RingGcmBlockEncryptor, BlockEncryptor};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileEncryptionProperties {
-    pub encrypt_footer: bool,
-    pub footer_key: Vec<u8>,
-    pub column_keys: Option<HashMap<Vec<u8>, Vec<u8>>>,
-    pub aad_prefix: Option<Vec<u8>>,
+    encrypt_footer: bool,
+    footer_key: Vec<u8>,
+    column_keys: Option<HashMap<Vec<u8>, Vec<u8>>>,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 impl FileEncryptionProperties {
@@ -53,5 +55,34 @@ impl EncryptionPropertiesBuilder {
             column_keys: self.column_keys,
             aad_prefix: self.aad_prefix,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FileEncryptor {
+    encryption_properties: FileEncryptionProperties,
+    footer_encryptor: Option<Arc<dyn BlockEncryptor>>,
+    column_encryptors: Option<HashMap<Vec<u8>, Arc<dyn BlockEncryptor>>>,
+    file_aad: Vec<u8>,
+}
+
+impl FileEncryptor {
+    pub(crate) fn new(
+        encryption_properties: FileEncryptionProperties, file_aad: Vec<u8>,
+    ) -> Self {
+        let footer_encryptor = RingGcmBlockEncryptor::new(&encryption_properties.footer_key.clone());
+        let mut column_encryptors: HashMap<Vec<u8>, Arc<dyn BlockEncryptor>> = HashMap::new();
+        if let Some(column_keys) = encryption_properties.column_keys.clone() {
+            for (column_name, key) in column_keys.iter() {
+                let column_encryptor = Arc::new(RingGcmBlockEncryptor::new(key));
+                column_encryptors.insert(column_name.clone(), column_encryptor);
+            }
+        }
+        Self {
+            encryption_properties,
+            footer_encryptor: Some(Arc::new(footer_encryptor)),
+            column_encryptors: Some(column_encryptors),
+            file_aad,
+        }
     }
 }

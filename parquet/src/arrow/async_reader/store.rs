@@ -173,14 +173,6 @@ impl AsyncFileReader for ParquetObjectReader {
     ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         Box::pin(async move {
             let file_size = self.meta.size;
-            #[cfg(not(feature = "encryption"))]
-            let metadata = ParquetMetaDataReader::new()
-                .with_column_indexes(self.preload_column_index)
-                .with_offset_indexes(self.preload_offset_index)
-                .with_prefetch_hint(self.metadata_size_hint)
-                .load_and_finish(self, file_size)
-                .await?;
-            #[cfg(feature = "encryption")]
             let metadata = ParquetMetaDataReader::new()
                 .with_column_indexes(self.preload_column_index)
                 .with_offset_indexes(self.preload_offset_index)
@@ -193,7 +185,6 @@ impl AsyncFileReader for ParquetObjectReader {
         })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::{
