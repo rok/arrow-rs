@@ -25,19 +25,21 @@ use crate::file::properties::WriterProperties;
 use arrow_array::cast::AsArray;
 use arrow_array::{types, RecordBatch};
 use std::fs::File;
+use crate::errors::ParquetError;
 
 /// Tests reading an encrypted file from the parquet-testing repository
+#[cfg(feature = "encryption")]
 pub fn verify_encryption_test_file_read(
     file: File,
     decryption_properties: FileDecryptionProperties,
-) {
+) -> crate::errors::Result<(), ParquetError> {
     let options = ArrowReaderOptions::default()
         .with_file_decryption_properties(decryption_properties.clone());
-    let metadata = ArrowReaderMetadata::load(&file, options.clone()).unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, options.clone())?;
     let file_metadata = metadata.metadata.file_metadata();
 
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
-    let record_reader = builder.build().unwrap();
+    let record_reader = builder.build()?;
 
     assert_eq!(file_metadata.num_rows(), 50);
     assert_eq!(file_metadata.schema_descr().num_columns(), 8);
@@ -49,7 +51,7 @@ pub fn verify_encryption_test_file_read(
 
     let mut row_count = 0;
     for batch in record_reader {
-        let batch = batch.unwrap();
+        let batch = batch?;
         row_count += batch.num_rows();
 
         let bool_col = batch.column(0).as_boolean();
@@ -99,6 +101,7 @@ pub fn verify_encryption_test_file_read(
     }
 
     assert_eq!(row_count, file_metadata.num_rows() as usize);
+    Ok(())
 }
 
 #[cfg(feature = "encryption")]
@@ -135,5 +138,5 @@ pub fn read_and_roundtrip_to_encrypted_file(
     writer.close().unwrap();
 
     // check re-written example data
-    verify_encryption_test_file_read(temp_file, decryption_properties);
+    verify_encryption_test_file_read(temp_file, decryption_properties).unwrap();
 }

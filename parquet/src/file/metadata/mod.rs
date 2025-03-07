@@ -673,7 +673,7 @@ impl RowGroupMetaData {
                         decryptor.get_column_metadata_decryptor(column_name.as_bytes())?
                     }
                     Some(TColumnCryptoMetaData::ENCRYPTIONWITHFOOTERKEY(_)) => {
-                        decryptor.get_footer_decryptor()
+                        decryptor.get_footer_decryptor()?
                     }
                 };
 

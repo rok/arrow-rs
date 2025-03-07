@@ -188,7 +188,7 @@ mod tests {
     fn test_round_trip() {
         let key = [0u8; 16];
         let mut encryptor = RingGcmBlockEncryptor::new(&key).unwrap();
-        let decryptor = RingGcmBlockDecryptor::new(&key);
+        let decryptor = RingGcmBlockDecryptor::new(&key).unwrap();
 
         let plaintext = b"hello, world!";
         let aad = b"some aad";
@@ -200,23 +200,3 @@ mod tests {
     }
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_round_trip() {
-        let key = [0u8; 16];
-        let mut encryptor = RingGcmBlockEncryptor::new(&key);
-        let decryptor = RingGcmBlockDecryptor::new(&key).unwrap();
-
-        let plaintext = b"hello, world!";
-        let aad = b"some aad";
-
-        let ciphertext = encryptor.encrypt(plaintext, aad);
-        let decrypted = decryptor.decrypt(&ciphertext, aad).unwrap();
-
-        assert_eq!(plaintext, decrypted.as_slice());
-    }
-}
