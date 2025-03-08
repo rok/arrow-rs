@@ -35,13 +35,17 @@ pub(crate) struct RingGcmBlockDecryptor {
 }
 
 impl RingGcmBlockDecryptor {
-    pub(crate) fn new(key_bytes: &[u8]) -> Self {
+    pub(crate) fn new(key_bytes: &[u8]) -> Result<Self, ParquetError> {
         // todo support other key sizes
-        let key = UnboundKey::new(&AES_128_GCM, key_bytes).unwrap();
-
-        Self {
-            key: LessSafeKey::new(key),
+        let algo = &AES_128_GCM;
+        if key_bytes.len() != algo.key_len() {
+            return Err(ParquetError::General("Invalid key length".into()));
         }
+        let key = UnboundKey::new(algo, key_bytes)?;
+
+        Ok(Self {
+            key: LessSafeKey::new(key),
+        })
     }
 }
 
@@ -184,7 +188,7 @@ mod tests {
     fn test_round_trip() {
         let key = [0u8; 16];
         let mut encryptor = RingGcmBlockEncryptor::new(&key).unwrap();
-        let decryptor = RingGcmBlockDecryptor::new(&key);
+        let decryptor = RingGcmBlockDecryptor::new(&key).unwrap();
 
         let plaintext = b"hello, world!";
         let aad = b"some aad";
@@ -195,3 +199,4 @@ mod tests {
         assert_eq!(plaintext, decrypted.as_slice());
     }
 }
+

@@ -421,6 +421,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             data_page_boundary_ascending: true,
             data_page_boundary_descending: true,
             last_non_null_data_page_min_max: None,
+            // metadata_encryptor: metadata_encryptor,
+            // data_encryptor: data_encryptor,
         }
     }
 
@@ -3426,7 +3428,7 @@ mod tests {
 
         let props = Arc::new(
             builder
-                .with_file_encryption_properties(file_encryption_properties)
+                .set_file_encryption_properties(&file_encryption_properties)
                 .set_data_page_row_count_limit(rows_per_batch)
                 .build(),
         );
@@ -3520,7 +3522,7 @@ mod tests {
 
         let props = Arc::new(
             builder
-                .with_file_encryption_properties(file_encryption_properties)
+                .set_file_encryption_properties(&file_encryption_properties)
                 .set_data_page_row_count_limit(rows_per_batch)
                 .build(),
         );

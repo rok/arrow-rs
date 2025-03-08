@@ -3730,7 +3730,7 @@ mod tests {
             // Ensure multiple pages per row group
             .set_write_batch_size(20)
             .set_data_page_row_count_limit(20)
-            .with_file_encryption_properties(file_encryption_properties)
+            .set_file_encryption_properties(&file_encryption_properties)
             .build();
 
         let mut writer =

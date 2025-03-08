@@ -291,6 +291,12 @@ impl WriterProperties {
         self.statistics_truncate_length
     }
 
+    // Return the encryption properties
+    #[cfg(feature = "encryption")]
+    pub fn file_encryption_properties(&self) -> Option<&FileEncryptionProperties> {
+        self.file_encryption_properties.as_ref()
+    }
+
     /// Returns `true` if type coercion is enabled.
     pub fn coerce_types(&self) -> bool {
         self.coerce_types
@@ -821,11 +827,11 @@ impl WriterPropertiesBuilder {
 
     /// Sets FileEncryptionProperties.
     #[cfg(feature = "encryption")]
-    pub fn with_file_encryption_properties(
+    pub fn set_file_encryption_properties(
         mut self,
-        file_encryption_properties: FileEncryptionProperties,
+        file_encryption_properties: &FileEncryptionProperties,
     ) -> Self {
-        self.file_encryption_properties = Some(file_encryption_properties);
+        self.file_encryption_properties = Some(file_encryption_properties.clone());
         self
     }
 }

@@ -305,6 +305,8 @@ impl ParquetMetaData {
     pub(crate) fn set_offset_index(&mut self, index: Option<ParquetOffsetIndex>) {
         self.offset_index = index;
     }
+
+
 }
 
 /// A builder for creating / manipulating [`ParquetMetaData`]
@@ -662,16 +664,16 @@ impl RowGroupMetaData {
                 let column_decryptor = match c.crypto_metadata.as_ref() {
                     None => {
                         return Err(general_err!(
-                            "No crypto_metadata is set for column {}, which has encrypted metadata",
-                            i
+                            "No crypto_metadata is set for column '{}', which has encrypted metadata",
+                            d.path().string()
                         ));
                     }
                     Some(TColumnCryptoMetaData::ENCRYPTIONWITHCOLUMNKEY(crypto_metadata)) => {
                         let column_name = crypto_metadata.path_in_schema.join(".");
-                        decryptor.get_column_metadata_decryptor(column_name.as_bytes())
+                        decryptor.get_column_metadata_decryptor(column_name.as_bytes())?
                     }
                     Some(TColumnCryptoMetaData::ENCRYPTIONWITHFOOTERKEY(_)) => {
-                        decryptor.get_footer_decryptor()
+                        decryptor.get_footer_decryptor()?
                     }
                 };
 
@@ -685,7 +687,10 @@ impl RowGroupMetaData {
 
                 let buf = c.encrypted_column_metadata.clone().unwrap();
                 let decrypted_cc_buf =
-                    column_decryptor.decrypt(buf.as_slice(), column_aad.as_ref())?;
+                    column_decryptor.decrypt(buf.as_slice(), column_aad.as_ref()).map_err(|_| {
+                        general_err!("Unable to decrypt column '{}', perhaps the column key is wrong or missing?",
+                            d.path().string())
+                    })?;
 
                 let mut prot = TCompactSliceInputProtocol::new(decrypted_cc_buf.as_slice());
                 c.meta_data = Some(ColumnMetaData::read_from_in_protocol(&mut prot)?);

@@ -305,6 +305,11 @@ impl<W: Write + Send> SerializedFileWriter<W> {
         Ok(())
     }
 
+    fn start_encrypted_file(buf: &mut TrackedWrite<W>) -> Result<()> {
+        buf.write_all(&PARQUET_MAGIC)?;
+        Ok(())
+    }
+
     /// Assembles and writes metadata at the end of the file.
     fn write_metadata(&mut self) -> Result<parquet::FileMetaData> {
         self.finished = true;
