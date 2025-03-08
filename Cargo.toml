@@ -77,7 +77,7 @@ edition = "2021"
 rust-version = "1.70"
 
 [workspace.dependencies]
-arrow = { version = "54.2.0", path = "./arrow", default-features = true }
+arrow = { version = "54.2.0", path = "./arrow", default-features = false }
 arrow-arith = { version = "54.2.0", path = "./arrow-arith" }
 arrow-array = { version = "54.2.0", path = "./arrow-array" }
 arrow-buffer = { version = "54.2.0", path = "./arrow-buffer" }

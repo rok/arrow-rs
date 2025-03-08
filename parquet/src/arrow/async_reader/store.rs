@@ -185,6 +185,7 @@ impl AsyncFileReader for ParquetObjectReader {
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
