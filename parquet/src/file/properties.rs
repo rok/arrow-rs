@@ -827,11 +827,11 @@ impl WriterPropertiesBuilder {
 
     /// Sets FileEncryptionProperties.
     #[cfg(feature = "encryption")]
-    pub fn with_file_encryption_properties(
+    pub fn set_file_encryption_properties(
         mut self,
-        file_encryption_properties: FileEncryptionProperties,
+        file_encryption_properties: &FileEncryptionProperties,
     ) -> Self {
-        self.file_encryption_properties = Some(file_encryption_properties);
+        self.file_encryption_properties = Some(file_encryption_properties.clone());
         self
     }
 }

@@ -126,7 +126,7 @@ pub fn read_and_roundtrip_to_encrypted_file(
 
     // write example data
     let props = WriterProperties::builder()
-        .with_file_encryption_properties(encryption_properties)
+        .set_file_encryption_properties(&encryption_properties)
         .build();
 
     let mut writer =
