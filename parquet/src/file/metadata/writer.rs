@@ -166,11 +166,11 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
 
         let row_groups = match self.file_encryptor.as_ref() {
             #[cfg(feature = "encryption")]
-            Some(file_encryptor) => Self::encrypt_row_groups(self.row_groups, file_encryptor)?,
-            _ => self.row_groups,
+            Some(file_encryptor) => Self::encrypt_row_groups(self.row_groups.clone(), file_encryptor)?,
+            _ => self.row_groups.clone(),
         };
 
-        let file_metadata = crate::format::FileMetaData {
+        let mut file_metadata = crate::format::FileMetaData {
             num_rows,
             row_groups,
             key_value_metadata: self.key_value_metadata.clone(),
@@ -218,6 +218,10 @@ impl<'a, W: Write> ThriftMetadataWriter<'a, W> {
         #[cfg(not(feature = "encryption"))]
         let magic = get_file_magic();
         self.buf.write_all(magic)?;
+
+        // Return unencrypted row_group for use in program
+        // E.g. when collecting statistics
+        file_metadata.row_groups = self.row_groups;
 
         Ok(file_metadata)
     }
