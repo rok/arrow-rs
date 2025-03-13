@@ -49,13 +49,18 @@ impl EncryptionKey {
     }
 }
 
+// For now, public fields so we can construct this directly
+// builder is broken
+// 1. Can't set aad key
+// 2. Can't construct with HashMap of column keys
+// 3. It's weird that column_keys are not optional unlike decryption
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEncryptionProperties {
-    encrypt_footer: bool,
-    footer_key: EncryptionKey,
-    column_keys: HashMap<String, EncryptionKey>,
-    aad_prefix: Option<Vec<u8>>,
-    store_aad_prefix: bool,
+    pub encrypt_footer: bool,
+    pub footer_key: EncryptionKey,
+    pub column_keys: HashMap<String, EncryptionKey>,
+    pub aad_prefix: Option<Vec<u8>>,
+    pub store_aad_prefix: bool,
 }
 
 impl FileEncryptionProperties {
