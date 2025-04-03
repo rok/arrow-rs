@@ -4839,7 +4839,7 @@ impl crate::thrift::TSerializable for ColumnIndex {
       i_prot.read_field_end()?;
     }
     i_prot.read_struct_end()?;
-    verify_required_field_exists("ColumnIndex.null_pages", &f_1)?;
+    verify_required_field_exists("ColumnIndex.null_pages", &f_1).unwrap(); // Force an error for now to help debug
     verify_required_field_exists("ColumnIndex.min_values", &f_2)?;
     verify_required_field_exists("ColumnIndex.max_values", &f_3)?;
     verify_required_field_exists("ColumnIndex.boundary_order", &f_4)?;
