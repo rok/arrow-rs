@@ -860,7 +860,7 @@ pub fn get_column_writers(
 
 /// Returns the [`ArrowColumnWriter`] for a given schema and supports columnar encryption
 #[cfg(feature = "encryption")]
-fn get_column_writers_with_encryptor(
+pub fn get_column_writers_with_encryptor(
     parquet: &SchemaDescriptor,
     props: &WriterPropertiesPtr,
     arrow: &SchemaRef,
