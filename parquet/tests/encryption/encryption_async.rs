@@ -22,15 +22,18 @@ use crate::encryption_util::{
 };
 use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::arrow_writer::ArrowWriterOptions;
-use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::arrow_writer::{compute_leaves, get_column_writers_with_encryptor, ArrowColumnChunk, ArrowLeafColumn, ArrowWriterOptions};
+use parquet::arrow::{ArrowSchemaConverter, AsyncArrowWriter};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::encryption::decrypt::FileDecryptionProperties;
-use parquet::encryption::encrypt::FileEncryptionProperties;
+use parquet::encryption::encrypt::{FileEncryptionProperties, FileEncryptor};
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use std::sync::Arc;
 use tokio::fs::File;
+use arrow_array::{Float32Array, Int32Array};
+use arrow_schema::{DataType, Field, Schema};
+use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 
 #[tokio::test]
 async fn test_non_uniform_encryption_plaintext_footer() {
@@ -490,4 +493,146 @@ async fn read_and_roundtrip_to_encrypted_file_async(
 
     let mut file = tokio::fs::File::from_std(temp_file.try_clone().unwrap());
     verify_encryption_test_file_read_async(&mut file, decryption_properties).await
+}
+
+async fn read_and_roundtrip_to_encrypted_file_multithreaded(
+    path: &str,
+    decryption_properties: FileDecryptionProperties,
+    encryption_properties: FileEncryptionProperties,
+) -> Result<(), ParquetError> {
+    let temp_file = tempfile::tempfile().unwrap();
+    let mut file = File::open(&path).await.unwrap();
+
+    let options =
+        ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties.clone());
+    let arrow_metadata = ArrowReaderMetadata::load_async(&mut file, options).await?;
+    let record_reader = ParquetRecordBatchStreamBuilder::new_with_metadata(
+        file.try_clone().await?,
+        arrow_metadata.clone(),
+    )
+    .build()?;
+    let record_batches = record_reader.try_collect::<Vec<_>>().await?;
+
+    let schema = Arc::new(arrow_metadata.schema());
+    let file_encryptor = Some(Arc::new(
+        FileEncryptor::new(encryption_properties.clone()).unwrap(),
+    ));
+
+    // Compute the parquet schema
+    let props = Arc::new(WriterProperties::default());
+    let parquet_schema = ArrowSchemaConverter::new()
+        .with_coerce_types(props.coerce_types())
+        .convert(&schema)
+        .unwrap();
+
+    // TODO: row_group_index
+    let col_writers =
+        get_column_writers_with_encryptor(&parquet_schema, &props, &schema, file_encryptor, 0)
+            .unwrap();
+
+    // Spawn a worker thread for each column
+    //
+    // Note: This is for demonstration purposes, a thread-pool e.g. rayon or tokio, would be better.
+    // The `map` produces an iterator of type `tuple of (thread handle, send channel)`.
+    let mut workers: Vec<_> = col_writers
+        .into_iter()
+        .map(|mut col_writer| {
+            let (send, recv) = std::sync::mpsc::channel::<ArrowLeafColumn>();
+            let handle = std::thread::spawn(move || {
+                // receive Arrays to encode via the channel
+                for col in recv {
+                    col_writer.write(&col)?;
+                }
+                // once the input is complete, close the writer
+                // to return the newly created ArrowColumnChunk
+                col_writer.close()
+            });
+            (handle, send)
+        })
+        .collect();
+
+    // // Create a threadpool
+    // let pool = ThreadPool::new();
+    // 
+    // // Submit a task to the pool
+    // pool.spawn(lazy(|| {
+    //     println!("Running task on thread pool");
+    //     Ok::<_, ()>(())
+    // }));
+    // 
+    // // Wait for the task to complete (or the pool to shutdown)
+    // pool.shutdown().await;
+    // println!("Pool shutdown complete.");
+
+    // Create parquet writer
+    let root_schema = parquet_schema.root_schema_ptr();
+    // write to memory in the example, but this could be a File
+    let mut out = Vec::with_capacity(1024);
+    let mut writer = SerializedFileWriter::new(&mut out, root_schema, props.clone()).unwrap();
+
+    // Start row group
+    let mut row_group_writer: SerializedRowGroupWriter<'_, _> = writer.next_row_group().unwrap();
+
+    // Create some example input columns to encode
+    let to_write = vec![
+        Arc::new(Int32Array::from_iter_values([1, 2, 3])) as _,
+        Arc::new(Float32Array::from_iter_values([1., 45., -1.])) as _,
+    ];
+    // Convert record batches to arrays
+    // let to_write = record_batches.iter()
+
+    // Send the input columns to the workers
+    let mut worker_iter = workers.iter_mut();
+    for (arr, field) in to_write.iter().zip(&schema.fields) {
+        for leaves in compute_leaves(field, arr).unwrap() {
+            worker_iter.next().unwrap().1.send(leaves).unwrap();
+        }
+    }
+
+    // Wait for the workers to complete encoding, and append
+    // the resulting column chunks to the row group (and the file)
+    for (handle, send) in workers {
+        drop(send); // Drop send side to signal termination
+        // wait for the worker to send the completed chunk
+        let chunk: ArrowColumnChunk = handle.join().unwrap().unwrap();
+        chunk.append_to_row_group(&mut row_group_writer).unwrap();
+    }
+    // Close the row group which writes to the underlying file
+    row_group_writer.close().unwrap();
+
+    let metadata = writer.close().unwrap();
+    assert_eq!(metadata.num_rows, 3);
+    Ok(())
+}
+
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_multi_threaded_encrypted_writing() {
+    let testdata = arrow::util::test_util::parquet_test_data();
+    let path = format!("{testdata}/encrypt_columns_and_footer.parquet.encrypted");
+
+    let footer_key = b"0123456789012345".to_vec(); // 128bit/16
+    let column_names = vec!["double_field", "float_field"];
+    let column_keys = vec![b"1234567890123450".to_vec(), b"1234567890123451".to_vec()];
+
+    let decryption_properties = FileDecryptionProperties::builder(footer_key.clone())
+        .with_column_keys(column_names.clone(), column_keys.clone())
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let file_encryption_properties = FileEncryptionProperties::builder(footer_key)
+        .with_column_keys(column_names, column_keys)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    read_and_roundtrip_to_encrypted_file_multithreaded(
+        &path,
+        decryption_properties,
+        file_encryption_properties,
+    )
+    .await
+    .unwrap();
 }
