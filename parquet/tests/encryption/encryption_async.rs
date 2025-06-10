@@ -20,20 +20,23 @@
 use crate::encryption_util::{
     verify_column_indexes, verify_encryption_test_data, TestKeyRetriever,
 };
+use arrow::compute::concat;
+use arrow_array::RecordBatch;
 use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::arrow_writer::{compute_leaves, get_column_writers_with_encryptor, ArrowColumnChunk, ArrowLeafColumn, ArrowWriterOptions};
-use parquet::arrow::{ArrowSchemaConverter, AsyncArrowWriter};
+use parquet::arrow::arrow_writer::{
+    compute_leaves, get_column_writers_with_encryptor, ArrowColumnChunk, ArrowLeafColumn,
+    ArrowWriterOptions,
+};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::{ArrowSchemaConverter, AsyncArrowWriter};
 use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::encryption::encrypt::{FileEncryptionProperties, FileEncryptor};
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
+use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use std::sync::Arc;
 use tokio::fs::File;
-use arrow_array::{Float32Array, Int32Array};
-use arrow_schema::{DataType, Field, Schema};
-use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 
 #[tokio::test]
 async fn test_non_uniform_encryption_plaintext_footer() {
@@ -439,14 +442,13 @@ async fn test_decrypt_page_index(
     Ok(())
 }
 
-async fn verify_encryption_test_file_read_async(
+async fn read_encrypted_file_async(
     file: &mut tokio::fs::File,
     decryption_properties: FileDecryptionProperties,
-) -> Result<(), ParquetError> {
+) -> Result<(Vec<RecordBatch>, ArrowReaderMetadata), ParquetError> {
     let options = ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties);
 
     let arrow_metadata = ArrowReaderMetadata::load_async(file, options).await?;
-    let metadata = arrow_metadata.metadata();
 
     let record_reader = ParquetRecordBatchStreamBuilder::new_with_metadata(
         file.try_clone().await?,
@@ -454,8 +456,15 @@ async fn verify_encryption_test_file_read_async(
     )
     .build()?;
     let record_batches = record_reader.try_collect::<Vec<_>>().await?;
+    Ok((record_batches, arrow_metadata.clone()))
+}
 
-    verify_encryption_test_data(record_batches, metadata);
+async fn verify_encryption_test_file_read_async(
+    file: &mut tokio::fs::File,
+    decryption_properties: FileDecryptionProperties,
+) -> Result<(), ParquetError> {
+    let (record_batches, metadata) = read_encrypted_file_async(file, decryption_properties).await?;
+    verify_encryption_test_data(record_batches, &metadata.metadata());
     Ok(())
 }
 
@@ -467,15 +476,8 @@ async fn read_and_roundtrip_to_encrypted_file_async(
     let temp_file = tempfile::tempfile().unwrap();
     let mut file = File::open(&path).await.unwrap();
 
-    let options =
-        ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties.clone());
-    let arrow_metadata = ArrowReaderMetadata::load_async(&mut file, options).await?;
-    let record_reader = ParquetRecordBatchStreamBuilder::new_with_metadata(
-        file.try_clone().await?,
-        arrow_metadata.clone(),
-    )
-    .build()?;
-    let record_batches = record_reader.try_collect::<Vec<_>>().await?;
+    let (record_batches, arrow_metadata) =
+        read_encrypted_file_async(&mut file, decryption_properties.clone()).await?;
 
     let props = WriterProperties::builder()
         .with_file_encryption_properties(encryption_properties)
@@ -500,20 +502,25 @@ async fn read_and_roundtrip_to_encrypted_file_multithreaded(
     decryption_properties: FileDecryptionProperties,
     encryption_properties: FileEncryptionProperties,
 ) -> Result<(), ParquetError> {
-    let temp_file = tempfile::tempfile().unwrap();
     let mut file = File::open(&path).await.unwrap();
+    let temp_file = tempfile::tempfile().unwrap();
 
-    let options =
-        ArrowReaderOptions::new().with_file_decryption_properties(decryption_properties.clone());
-    let arrow_metadata = ArrowReaderMetadata::load_async(&mut file, options).await?;
-    let record_reader = ParquetRecordBatchStreamBuilder::new_with_metadata(
-        file.try_clone().await?,
-        arrow_metadata.clone(),
-    )
-    .build()?;
-    let record_batches = record_reader.try_collect::<Vec<_>>().await?;
+    let (record_batches, arrow_metadata) =
+        read_encrypted_file_async(&mut file, decryption_properties.clone()).await?;
+    verify_encryption_test_data(record_batches.clone(), &arrow_metadata.metadata());
 
     let schema = Arc::new(arrow_metadata.schema());
+
+    // Convert record batches to arrays
+    let mut to_write = vec![];
+    for (index, _) in schema.fields.iter().enumerate() {
+        let col = record_batches
+            .iter()
+            .map(|x| x.column(index).as_ref())
+            .collect::<Vec<_>>();
+        to_write.push(Arc::new(concat(&col)?));
+    }
+
     let file_encryptor = Some(Arc::new(
         FileEncryptor::new(encryption_properties.clone()).unwrap(),
     ));
@@ -530,10 +537,8 @@ async fn read_and_roundtrip_to_encrypted_file_multithreaded(
         get_column_writers_with_encryptor(&parquet_schema, &props, &schema, file_encryptor, 0)
             .unwrap();
 
+    // TODO: switch to Tokio?
     // Spawn a worker thread for each column
-    //
-    // Note: This is for demonstration purposes, a thread-pool e.g. rayon or tokio, would be better.
-    // The `map` produces an iterator of type `tuple of (thread handle, send channel)`.
     let mut workers: Vec<_> = col_writers
         .into_iter()
         .map(|mut col_writer| {
@@ -551,35 +556,12 @@ async fn read_and_roundtrip_to_encrypted_file_multithreaded(
         })
         .collect();
 
-    // // Create a threadpool
-    // let pool = ThreadPool::new();
-    // 
-    // // Submit a task to the pool
-    // pool.spawn(lazy(|| {
-    //     println!("Running task on thread pool");
-    //     Ok::<_, ()>(())
-    // }));
-    // 
-    // // Wait for the task to complete (or the pool to shutdown)
-    // pool.shutdown().await;
-    // println!("Pool shutdown complete.");
-
-    // Create parquet writer
+    // Create parquet writer and write to temporary file
     let root_schema = parquet_schema.root_schema_ptr();
-    // write to memory in the example, but this could be a File
-    let mut out = Vec::with_capacity(1024);
-    let mut writer = SerializedFileWriter::new(&mut out, root_schema, props.clone()).unwrap();
+    let mut writer = SerializedFileWriter::new(temp_file, root_schema, props.clone()).unwrap();
 
     // Start row group
     let mut row_group_writer: SerializedRowGroupWriter<'_, _> = writer.next_row_group().unwrap();
-
-    // Create some example input columns to encode
-    let to_write = vec![
-        Arc::new(Int32Array::from_iter_values([1, 2, 3])) as _,
-        Arc::new(Float32Array::from_iter_values([1., 45., -1.])) as _,
-    ];
-    // Convert record batches to arrays
-    // let to_write = record_batches.iter()
 
     // Send the input columns to the workers
     let mut worker_iter = workers.iter_mut();
@@ -593,7 +575,7 @@ async fn read_and_roundtrip_to_encrypted_file_multithreaded(
     // the resulting column chunks to the row group (and the file)
     for (handle, send) in workers {
         drop(send); // Drop send side to signal termination
-        // wait for the worker to send the completed chunk
+                    // wait for the worker to send the completed chunk
         let chunk: ArrowColumnChunk = handle.join().unwrap().unwrap();
         chunk.append_to_row_group(&mut row_group_writer).unwrap();
     }
@@ -601,10 +583,13 @@ async fn read_and_roundtrip_to_encrypted_file_multithreaded(
     row_group_writer.close().unwrap();
 
     let metadata = writer.close().unwrap();
-    assert_eq!(metadata.num_rows, 3);
+    assert_eq!(metadata.num_rows, 50);
+
+    // TODO
+    // let (record_batches, metadata) = read_encrypted_file_async(temp_file, decryption_properties).await?;
+
     Ok(())
 }
-
 
 #[cfg(feature = "encryption")]
 #[tokio::test]
