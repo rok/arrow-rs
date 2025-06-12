@@ -883,7 +883,7 @@ pub fn get_column_writers_with_encryptor(
 }
 
 /// Gets [`ArrowColumnWriter`] instances for different data types
-struct ArrowColumnWriterFactory {
+pub struct ArrowColumnWriterFactory {
     #[cfg(feature = "encryption")]
     row_group_index: usize,
     #[cfg(feature = "encryption")]
@@ -939,7 +939,7 @@ impl ArrowColumnWriterFactory {
     }
 
     /// Gets the [`ArrowColumnWriter`] for the given `data_type`
-    fn get_arrow_column_writer(
+    pub fn get_arrow_column_writer(
         &self,
         data_type: &ArrowDataType,
         props: &WriterPropertiesPtr,
