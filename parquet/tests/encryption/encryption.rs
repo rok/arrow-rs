@@ -28,16 +28,14 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
 };
-use parquet::arrow::arrow_writer::{
-    compute_leaves, get_column_writers_with_encryptor, ArrowColumnChunk, ArrowLeafColumn, ArrowColumnWriterFactory,
-};
+use parquet::arrow::arrow_writer::{compute_leaves, get_column_writers_with_encryptor, ArrowColumnChunk, ArrowLeafColumn, ArrowColumnWriterFactory, ArrowRowGroupWriterFactory};
 use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
 use parquet::data_type::{ByteArray, ByteArrayType};
 use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::encryption::encrypt::{FileEncryptionProperties, FileEncryptor};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
@@ -1106,7 +1104,6 @@ fn read_and_roundtrip_to_encrypted_file(
     verify_encryption_test_file_read(temp_file, decryption_properties);
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn test_multi_threaded_encrypted_writing() {
     let temp_file = tempfile::tempfile().unwrap();
@@ -1212,7 +1209,7 @@ fn test_multi_threaded_encrypted_writing() {
     let options =
         ArrowReaderOptions::default().with_file_decryption_properties(decryption_properties);
     let reader_metadata = ArrowReaderMetadata::load(&temp_file, options.clone()).unwrap();
-    let read_metadata = reader_metadata.metadata();
+    let metadata = reader_metadata.metadata();
 
     let builder =
         ParquetRecordBatchReaderBuilder::try_new_with_options(temp_file, options).unwrap();
@@ -1220,4 +1217,122 @@ fn test_multi_threaded_encrypted_writing() {
     let record_batches = record_reader
         .map(|x| x.unwrap())
         .collect::<Vec<RecordBatch>>();
+}
+
+#[test]
+fn test_multi_threaded_writing_3() {
+    let temp_file = tempfile::tempfile().unwrap();
+
+    // The arrow schema
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i32", DataType::Int32, false),
+        Field::new("f32", DataType::Float32, false),
+    ]));
+
+    let file_encryption_properties = FileEncryptionProperties::builder(b"0123456789012345".into())
+        .with_column_key("i32", b"1234567890123450".into())
+        .with_column_key("f32", b"1234567890123451".into())
+        .build()
+        .unwrap();
+    let decryption_properties = FileDecryptionProperties::builder(b"0123456789012345".into())
+        .with_column_key("i32", b"1234567890123450".into())
+        .with_column_key("f32", b"1234567890123451".into())
+        .build()
+        .unwrap();
+
+    // Compute the parquet schema
+    let props = WriterPropertiesBuilder::with_defaults().with_file_encryption_properties(file_encryption_properties).build();
+    let parquet_schema = ArrowSchemaConverter::new()
+        .with_coerce_types(props.coerce_types())
+        .convert(&schema)
+        .unwrap();
+    // let root_schema = parquet_schema.root_schema_ptr();
+
+
+    // Create parquet writer
+    let arrow_writer = ArrowWriter::try_new(&temp_file, schema.clone(), Some(props.clone())).unwrap();
+    let writer = arrow_writer.writer;
+
+    let mut row_group_writer = ArrowRowGroupWriterFactory::new(&writer)
+        // .with_file_encryptor(writer.file_encryptor())
+        .create_row_group_writer(&parquet_schema, writer.properties(), &schema, 0).unwrap();
+
+    let col_writers = row_group_writer.writers.iter()
+        .map(|col_writer| { col_writer.clone() })
+        .collect::<Vec<_>>();
+
+    // Spawn a worker thread for each column
+    //
+    // Note: This is for demonstration purposes, a thread-pool e.g. rayon or tokio, would be better.
+    // The `map` produces an iterator of type `tuple of (thread handle, send channel)`.
+    let mut workers: Vec<_> = col_writers
+        .into_iter()
+        .map(|mut col_writer| {
+            let (send, recv) = std::sync::mpsc::channel::<ArrowLeafColumn>();
+            let handle = std::thread::spawn(move || {
+                // receive Arrays to encode via the channel
+                for col in recv {
+                    col_writer.write(&col)?;
+                }
+                // once the input is complete, close the writer
+                // to return the newly created ArrowColumnChunk
+                col_writer.close()
+            });
+            (handle, send)
+        })
+        .collect();
+
+    // Create parquet writer
+    let root_schema = parquet_schema.root_schema_ptr();
+    // write to memory in the example, but this could be a File
+    // let mut out = Vec::with_capacity(1024);
+    // let mut writer = SerializedFileWriter::new(&mut out, root_schema, Arc::new(props))
+    //     .unwrap();
+
+    // // Start row group
+    // let mut row_group_writer: SerializedRowGroupWriter<'_, _> = writer
+    //     .next_row_group()
+    //     .unwrap();
+
+    // Create some example input columns to encode
+    let to_write = vec![
+        Arc::new(Int32Array::from_iter_values([1, 2, 3])) as _,
+        Arc::new(Float32Array::from_iter_values([1., 45., -1.])) as _,
+    ];
+
+    // Send the input columns to the workers
+    let mut worker_iter = workers.iter_mut();
+    for (arr, field) in to_write.iter().zip(&schema.fields) {
+        for leaves in compute_leaves(field, arr).unwrap() {
+            worker_iter.next().unwrap().1.send(leaves).unwrap();
+        }
+    }
+
+    // Wait for the workers to complete encoding, and append
+    // the resulting column chunks to the row group (and the file)
+    for (handle, send) in workers {
+        drop(send); // Drop send side to signal termination
+        // wait for the worker to send the completed chunk
+        let chunk: ArrowColumnChunk = handle.join().unwrap().unwrap();
+        chunk.append_to_row_group(&mut row_group_writer).unwrap();
+    }
+    // Close the row group which writes to the underlying file
+    row_group_writer.close().unwrap();
+
+    let metadata = writer.close().unwrap();
+    assert_eq!(metadata.num_rows, 3);
+
+    // read data back
+    let options =
+        ArrowReaderOptions::default().with_file_decryption_properties(decryption_properties);
+    let reader_metadata = ArrowReaderMetadata::load(&temp_file, options.clone()).unwrap();
+    let metadata = reader_metadata.metadata();
+
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new_with_options(temp_file, options).unwrap();
+    let record_reader = builder.build().unwrap();
+    let record_batches = record_reader
+        .map(|x| x.unwrap())
+        .collect::<Vec<RecordBatch>>();
+    // assert_eq!(to_write, record_batches);
 }
