@@ -130,7 +130,7 @@ mod levels;
 /// [support nanosecond intervals]: https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#interval
 pub struct ArrowWriter<W: Write> {
     /// Underlying Parquet writer
-    writer: SerializedFileWriter<W>,
+    pub writer: SerializedFileWriter<W>,
 
     /// The in-progress row group if any
     in_progress: Option<ArrowRowGroupWriter>,
@@ -755,8 +755,8 @@ impl ArrowColumnWriter {
 }
 
 /// Encodes [`RecordBatch`] to a parquet row group
-struct ArrowRowGroupWriter {
-    writers: Vec<ArrowColumnWriter>,
+pub struct ArrowRowGroupWriter {
+    pub writers: Vec<ArrowColumnWriter>,
     schema: SchemaRef,
     buffered_rows: usize,
 }
@@ -789,44 +789,49 @@ impl ArrowRowGroupWriter {
     }
 }
 
-struct ArrowRowGroupWriterFactory {
+pub struct ArrowRowGroupWriterFactory {
     #[cfg(feature = "encryption")]
     file_encryptor: Option<Arc<FileEncryptor>>,
 }
 
 impl ArrowRowGroupWriterFactory {
     #[cfg(feature = "encryption")]
-    fn new<W: Write + Send>(file_writer: &SerializedFileWriter<W>) -> Self {
+    pub fn new<W: Write + Send>(file_writer: &SerializedFileWriter<W>) -> Self {
         Self {
             file_encryptor: file_writer.file_encryptor(),
         }
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn new<W: Write + Send>(_file_writer: &SerializedFileWriter<W>) -> Self {
+    pub fn new<W: Write + Send>(_file_writer: &SerializedFileWriter<W>) -> Self {
         Self {}
     }
 
     #[cfg(feature = "encryption")]
-    fn create_row_group_writer(
+    pub fn create_row_group_writer(
         &self,
         parquet: &SchemaDescriptor,
         props: &WriterPropertiesPtr,
         arrow: &SchemaRef,
         row_group_index: usize,
     ) -> Result<ArrowRowGroupWriter> {
-        let writers = get_column_writers_with_encryptor(
-            parquet,
-            props,
-            arrow,
-            self.file_encryptor.clone(),
-            row_group_index,
-        )?;
+        let mut writers = Vec::with_capacity(arrow.fields.len());
+        let mut leaves = parquet.columns().iter();
+        let column_factory =
+            ArrowColumnWriterFactory::new().with_file_encryptor(row_group_index, self.file_encryptor.clone());
+        for field in &arrow.fields {
+            column_factory.get_arrow_column_writer(
+                field.data_type(),
+                props,
+                &mut leaves,
+                &mut writers,
+            )?;
+        }
         Ok(ArrowRowGroupWriter::new(writers, arrow))
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn create_row_group_writer(
+    pub fn create_row_group_writer(
         &self,
         parquet: &SchemaDescriptor,
         props: &WriterPropertiesPtr,
