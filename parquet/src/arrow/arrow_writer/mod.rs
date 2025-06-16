@@ -770,7 +770,7 @@ impl ArrowRowGroupWriter {
         }
     }
 
-    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         self.buffered_rows += batch.num_rows();
         let mut writers = self.writers.iter_mut();
         for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
@@ -817,8 +817,8 @@ impl ArrowRowGroupWriterFactory {
     ) -> Result<ArrowRowGroupWriter> {
         let mut writers = Vec::with_capacity(arrow.fields.len());
         let mut leaves = parquet.columns().iter();
-        let column_factory =
-            ArrowColumnWriterFactory::new().with_file_encryptor(row_group_index, self.file_encryptor.clone());
+        let column_factory = ArrowColumnWriterFactory::new()
+            .with_file_encryptor(row_group_index, self.file_encryptor.clone());
         for field in &arrow.fields {
             column_factory.get_arrow_column_writer(
                 field.data_type(),

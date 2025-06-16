@@ -504,13 +504,13 @@ async fn read_and_roundtrip_to_encrypted_file_async(
 // ) -> Result<(), ParquetError> {
 //     let mut file = File::open(&path).await.unwrap();
 //     let temp_file = tempfile::tempfile().unwrap();
-// 
+//
 //     let (record_batches, arrow_metadata) =
 //         read_encrypted_file_async(&mut file, decryption_properties.clone()).await?;
 //     verify_encryption_test_data(record_batches.clone(), &arrow_metadata.metadata());
-// 
+//
 //     let schema = Arc::new(arrow_metadata.schema());
-// 
+//
 //     // Convert record batches to arrays
 //     let mut to_write = vec![];
 //     for (index, _) in schema.fields.iter().enumerate() {
@@ -520,23 +520,23 @@ async fn read_and_roundtrip_to_encrypted_file_async(
 //             .collect::<Vec<_>>();
 //         to_write.push(Arc::new(concat(&col)?));
 //     }
-// 
+//
 //     let file_encryptor = Some(Arc::new(
 //         FileEncryptor::new(encryption_properties.clone()).unwrap(),
 //     ));
-// 
+//
 //     // Compute the parquet schema
 //     let props = Arc::new(WriterProperties::default());
 //     let parquet_schema = ArrowSchemaConverter::new()
 //         .with_coerce_types(props.coerce_types())
 //         .convert(&schema)
 //         .unwrap();
-// 
+//
 //     // TODO: row_group_index
 //     let col_writers =
 //         get_column_writers_with_encryptor(&parquet_schema, &props, &schema, file_encryptor, 0)
 //             .unwrap();
-// 
+//
 //     // TODO: switch to Tokio?
 //     // Spawn a worker thread for each column
 //     let mut workers: Vec<_> = col_writers
@@ -555,14 +555,14 @@ async fn read_and_roundtrip_to_encrypted_file_async(
 //             (handle, send)
 //         })
 //         .collect();
-// 
+//
 //     // Create parquet writer and write to temporary file
 //     let root_schema = parquet_schema.root_schema_ptr();
 //     let mut writer = SerializedFileWriter::new(temp_file, root_schema, props.clone()).unwrap();
-// 
+//
 //     // Start row group
 //     let mut row_group_writer: SerializedRowGroupWriter<'_, _> = writer.next_row_group().unwrap();
-// 
+//
 //     // Send the input columns to the workers
 //     let mut worker_iter = workers.iter_mut();
 //     for (arr, field) in to_write.iter().zip(&schema.fields) {
@@ -570,7 +570,7 @@ async fn read_and_roundtrip_to_encrypted_file_async(
 //             worker_iter.next().unwrap().1.send(leaves).unwrap();
 //         }
 //     }
-// 
+//
 //     // Wait for the workers to complete encoding, and append
 //     // the resulting column chunks to the row group (and the file)
 //     for (handle, send) in workers {
@@ -581,38 +581,38 @@ async fn read_and_roundtrip_to_encrypted_file_async(
 //     }
 //     // Close the row group which writes to the underlying file
 //     row_group_writer.close().unwrap();
-// 
+//
 //     let metadata = writer.close().unwrap();
 //     assert_eq!(metadata.num_rows, 50);
-// 
+//
 //     // TODO
 //     // let (record_batches, metadata) = read_encrypted_file_async(temp_file, decryption_properties).await?;
-// 
+//
 //     Ok(())
 // }
-// 
+//
 // #[cfg(feature = "encryption")]
 // #[tokio::test]
 // async fn test_multi_threaded_encrypted_writing() {
 //     let testdata = arrow::util::test_util::parquet_test_data();
 //     let path = format!("{testdata}/encrypt_columns_and_footer.parquet.encrypted");
-// 
+//
 //     let footer_key = b"0123456789012345".to_vec(); // 128bit/16
 //     let column_names = vec!["double_field", "float_field"];
 //     let column_keys = vec![b"1234567890123450".to_vec(), b"1234567890123451".to_vec()];
-// 
+//
 //     let decryption_properties = FileDecryptionProperties::builder(footer_key.clone())
 //         .with_column_keys(column_names.clone(), column_keys.clone())
 //         .unwrap()
 //         .build()
 //         .unwrap();
-// 
+//
 //     let file_encryption_properties = FileEncryptionProperties::builder(footer_key)
 //         .with_column_keys(column_names, column_keys)
 //         .unwrap()
 //         .build()
 //         .unwrap();
-// 
+//
 //     read_and_roundtrip_to_encrypted_file_multithreaded(
 //         &path,
 //         decryption_properties,
