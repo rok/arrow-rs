@@ -781,7 +781,7 @@ impl ArrowRowGroupWriter {
         Ok(())
     }
 
-    fn close(self) -> Result<Vec<ArrowColumnChunk>> {
+    pub fn close(self) -> Result<Vec<ArrowColumnChunk>> {
         self.writers
             .into_iter()
             .map(|writer| writer.close())
