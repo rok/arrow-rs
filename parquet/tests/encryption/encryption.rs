@@ -1068,14 +1068,10 @@ fn test_decrypt_page_index(
     Ok(())
 }
 
-fn read_and_roundtrip_to_encrypted_file(
+fn read_encrypted_file(
     path: &str,
     decryption_properties: FileDecryptionProperties,
-    encryption_properties: FileEncryptionProperties,
-) {
-    let temp_file = tempfile::tempfile().unwrap();
-
-    // read example data
+) -> Result<(Vec<RecordBatch>, ArrowReaderMetadata), ParquetError> {
     let file = File::open(path).unwrap();
     let options = ArrowReaderOptions::default()
         .with_file_decryption_properties(decryption_properties.clone());
@@ -1086,7 +1082,28 @@ fn read_and_roundtrip_to_encrypted_file(
     let batches = batch_reader
         .collect::<parquet::errors::Result<Vec<RecordBatch>, _>>()
         .unwrap();
+    Ok((batches, metadata))
+}
 
+fn read_and_roundtrip_to_encrypted_file(
+    path: &str,
+    decryption_properties: FileDecryptionProperties,
+    encryption_properties: FileEncryptionProperties,
+) {
+    // read example data
+    let (batches, metadata) = read_encrypted_file(path, decryption_properties.clone()).unwrap();
+    // let file = File::open(path).unwrap();
+    // let options = ArrowReaderOptions::default()
+    //     .with_file_decryption_properties(decryption_properties.clone());
+    // let metadata = ArrowReaderMetadata::load(&file, options.clone()).unwrap();
+    //
+    // let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
+    // let batch_reader = builder.build().unwrap();
+    // let batches = batch_reader
+    //     .collect::<parquet::errors::Result<Vec<RecordBatch>, _>>()
+    //     .unwrap();
+
+    let temp_file = tempfile::tempfile().unwrap();
     // write example data
     let props = WriterProperties::builder()
         .with_file_encryption_properties(encryption_properties)
@@ -1222,24 +1239,25 @@ fn test_multi_threaded_encrypted_writing() {
 
 #[tokio::test]
 async fn test_multi_threaded_writing_3() {
-    let temp_file = tempfile::tempfile().unwrap();
+    let testdata = arrow::util::test_util::parquet_test_data();
+    let path = format!("{testdata}/encrypt_columns_and_footer.parquet.encrypted");
 
-    // The arrow schema
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("i32", DataType::Int32, false),
-        Field::new("f32", DataType::Float32, false),
-    ]));
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
 
     let file_encryption_properties = FileEncryptionProperties::builder(b"0123456789012345".into())
-        .with_column_key("i32", b"1234567890123450".into())
-        .with_column_key("f32", b"1234567890123451".into())
+        .with_column_key("double_field", b"1234567890123450".into())
+        .with_column_key("float_field", b"1234567890123451".into())
         .build()
         .unwrap();
     let decryption_properties = FileDecryptionProperties::builder(b"0123456789012345".into())
-        .with_column_key("i32", b"1234567890123450".into())
-        .with_column_key("f32", b"1234567890123451".into())
+        .with_column_key("double_field", b"1234567890123450".into())
+        .with_column_key("float_field", b"1234567890123451".into())
         .build()
         .unwrap();
+
+    let (record_batches, metadata) =
+        read_encrypted_file(&path, decryption_properties.clone()).unwrap();
+    let schema = metadata.schema().clone();
 
     // Compute the parquet schema
     let props = WriterPropertiesBuilder::with_defaults()
@@ -1255,14 +1273,6 @@ async fn test_multi_threaded_writing_3() {
         ArrowWriter::try_new(&temp_file, schema.clone(), Some(props.clone())).unwrap();
     let writer_properties = arrow_writer.writer.properties().clone();
     let row_group_writer_factory = ArrowRowGroupWriterFactory::new(&arrow_writer.writer);
-
-    // TODO: read data from file instead of hardcoding it
-    // Create some example input columns to encode
-    let to_write = vec![
-        Arc::new(Int32Array::from_iter_values([1, 2, 3])) as _,
-        Arc::new(Float32Array::from_iter_values([1., 45., -1.])) as _,
-    ];
-    let record_batches = vec![RecordBatch::try_new(schema.clone(), to_write).unwrap()];
 
     let mut join_set = JoinSet::new();
 
@@ -1288,21 +1298,12 @@ async fn test_multi_threaded_writing_3() {
     }
     // Wait for all threads to complete
     join_set.join_all().await;
+    // let metadata = arrow_writer.close().unwrap();
 
-    let metadata = arrow_writer.close().unwrap();
-    // assert_eq!(metadata.num_rows, 3);
+    let temp_file_path = temp_file.path().to_str().unwrap();
+    let (record_batches_2, metadata_2) =
+        read_encrypted_file(&temp_file_path, decryption_properties.clone()).unwrap();
 
-    let options =
-        ArrowReaderOptions::default().with_file_decryption_properties(decryption_properties);
-    let reader_metadata = ArrowReaderMetadata::load(&temp_file, options.clone()).unwrap();
-    let metadata = reader_metadata.metadata();
-
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new_with_options(temp_file, options).unwrap();
-    let record_reader = builder.build().unwrap();
-    let record_batches = record_reader
-        .map(|x| x.unwrap())
-        .collect::<Vec<RecordBatch>>();
-
-    verify_encryption_test_data(record_batches, metadata);
+    assert_eq!(record_batches.len(), 1);
+    verify_encryption_test_data(record_batches_2, metadata_2.metadata());
 }
