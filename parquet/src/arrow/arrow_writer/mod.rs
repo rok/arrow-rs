@@ -130,7 +130,7 @@ mod levels;
 /// [support nanosecond intervals]: https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#interval
 pub struct ArrowWriter<W: Write> {
     /// Underlying Parquet writer
-    writer: SerializedFileWriter<W>,
+    pub writer: SerializedFileWriter<W>,
 
     /// The in-progress row group if any
     in_progress: Option<ArrowRowGroupWriter>,
@@ -297,6 +297,14 @@ impl<W: Write + Send> ArrowWriter<W> {
         Ok(())
     }
 
+    /// Writes the given buf bytes to the internal buffer.
+    ///
+    /// It's safe to use this method to write data to the underlying writer,
+    /// because it will ensure that the buffering and byte‐counting layers are used.
+    pub fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(buf)
+    }
+
     /// Flushes all buffered rows into a new row group
     pub fn flush(&mut self) -> Result<()> {
         let in_progress = match self.in_progress.take() {
@@ -326,8 +334,12 @@ impl<W: Write + Send> ArrowWriter<W> {
 
     /// Returns a mutable reference to the underlying writer.
     ///
-    /// It is inadvisable to directly write to the underlying writer, doing so
-    /// will likely result in a corrupt parquet file
+    /// **Warning**: if you write directly to this writer, you will skip
+    /// the `TrackedWrite` buffering and byte‐counting layers. That’ll cause
+    /// the file footer’s recorded offsets and sizes to diverge from reality,
+    /// resulting in an unreadable or corrupted Parquet file.
+    ///
+    /// If you want to write safely to the underlying writer, use [`Self::write_all`].
     pub fn inner_mut(&mut self) -> &mut W {
         self.writer.inner_mut()
     }
@@ -743,8 +755,8 @@ impl ArrowColumnWriter {
 }
 
 /// Encodes [`RecordBatch`] to a parquet row group
-struct ArrowRowGroupWriter {
-    writers: Vec<ArrowColumnWriter>,
+pub struct ArrowRowGroupWriter {
+    pub writers: Vec<ArrowColumnWriter>,
     schema: SchemaRef,
     buffered_rows: usize,
 }
@@ -758,7 +770,7 @@ impl ArrowRowGroupWriter {
         }
     }
 
-    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         self.buffered_rows += batch.num_rows();
         let mut writers = self.writers.iter_mut();
         for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
@@ -769,7 +781,7 @@ impl ArrowRowGroupWriter {
         Ok(())
     }
 
-    fn close(self) -> Result<Vec<ArrowColumnChunk>> {
+    pub fn close(self) -> Result<Vec<ArrowColumnChunk>> {
         self.writers
             .into_iter()
             .map(|writer| writer.close())
@@ -777,44 +789,49 @@ impl ArrowRowGroupWriter {
     }
 }
 
-struct ArrowRowGroupWriterFactory {
+pub struct ArrowRowGroupWriterFactory {
     #[cfg(feature = "encryption")]
     file_encryptor: Option<Arc<FileEncryptor>>,
 }
 
 impl ArrowRowGroupWriterFactory {
     #[cfg(feature = "encryption")]
-    fn new<W: Write + Send>(file_writer: &SerializedFileWriter<W>) -> Self {
+    pub fn new<W: Write + Send>(file_writer: &SerializedFileWriter<W>) -> Self {
         Self {
             file_encryptor: file_writer.file_encryptor(),
         }
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn new<W: Write + Send>(_file_writer: &SerializedFileWriter<W>) -> Self {
+    pub fn new<W: Write + Send>(_file_writer: &SerializedFileWriter<W>) -> Self {
         Self {}
     }
 
     #[cfg(feature = "encryption")]
-    fn create_row_group_writer(
+    pub fn create_row_group_writer(
         &self,
         parquet: &SchemaDescriptor,
         props: &WriterPropertiesPtr,
         arrow: &SchemaRef,
         row_group_index: usize,
     ) -> Result<ArrowRowGroupWriter> {
-        let writers = get_column_writers_with_encryptor(
-            parquet,
-            props,
-            arrow,
-            self.file_encryptor.clone(),
-            row_group_index,
-        )?;
+        let mut writers = Vec::with_capacity(arrow.fields.len());
+        let mut leaves = parquet.columns().iter();
+        let column_factory = ArrowColumnWriterFactory::new()
+            .with_file_encryptor(row_group_index, self.file_encryptor.clone());
+        for field in &arrow.fields {
+            column_factory.get_arrow_column_writer(
+                field.data_type(),
+                props,
+                &mut leaves,
+                &mut writers,
+            )?;
+        }
         Ok(ArrowRowGroupWriter::new(writers, arrow))
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn create_row_group_writer(
+    pub fn create_row_group_writer(
         &self,
         parquet: &SchemaDescriptor,
         props: &WriterPropertiesPtr,
@@ -848,7 +865,7 @@ pub fn get_column_writers(
 
 /// Returns the [`ArrowColumnWriter`] for a given schema and supports columnar encryption
 #[cfg(feature = "encryption")]
-fn get_column_writers_with_encryptor(
+pub fn get_column_writers_with_encryptor(
     parquet: &SchemaDescriptor,
     props: &WriterPropertiesPtr,
     arrow: &SchemaRef,
@@ -871,7 +888,7 @@ fn get_column_writers_with_encryptor(
 }
 
 /// Gets [`ArrowColumnWriter`] instances for different data types
-struct ArrowColumnWriterFactory {
+pub struct ArrowColumnWriterFactory {
     #[cfg(feature = "encryption")]
     row_group_index: usize,
     #[cfg(feature = "encryption")]
@@ -927,7 +944,7 @@ impl ArrowColumnWriterFactory {
     }
 
     /// Gets the [`ArrowColumnWriter`] for the given `data_type`
-    fn get_arrow_column_writer(
+    pub fn get_arrow_column_writer(
         &self,
         data_type: &ArrowDataType,
         props: &WriterPropertiesPtr,
@@ -1328,6 +1345,7 @@ mod tests {
 
     use crate::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
     use crate::arrow::ARROW_SCHEMA_META_KEY;
+    use crate::file::page_encoding_stats::PageEncodingStats;
     use crate::format::PageHeader;
     use crate::thrift::TCompactSliceInputProtocol;
     use arrow::datatypes::ToByteSlice;
@@ -3834,5 +3852,49 @@ mod tests {
         assert!(!stats.is_min_value_exact.unwrap());
         assert_eq!(stats.max_value.unwrap(), "Bm".as_bytes());
         assert_eq!(stats.min_value.unwrap(), "Bl".as_bytes());
+    }
+
+    #[test]
+    fn test_page_encoding_statistics_roundtrip() {
+        let batch_schema = Schema::new(vec![Field::new(
+            "int32",
+            arrow_schema::DataType::Int32,
+            false,
+        )]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(batch_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as _],
+        )
+        .unwrap();
+
+        let mut file: File = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, Arc::new(batch_schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        let file_metadata = writer.close().unwrap();
+
+        assert_eq!(file_metadata.row_groups.len(), 1);
+        assert_eq!(file_metadata.row_groups[0].columns.len(), 1);
+        let chunk_meta = file_metadata.row_groups[0].columns[0]
+            .meta_data
+            .as_ref()
+            .expect("column metadata missing");
+        assert!(chunk_meta.encoding_stats.is_some());
+        let chunk_page_stats = chunk_meta.encoding_stats.as_ref().unwrap();
+
+        // check that the read metadata is also correct
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(file, options).unwrap();
+
+        let rowgroup = reader.get_row_group(0).expect("row group missing");
+        assert_eq!(rowgroup.num_columns(), 1);
+        let column = rowgroup.metadata().column(0);
+        assert!(column.page_encoding_stats().is_some());
+        let file_page_stats = column.page_encoding_stats().unwrap();
+        let chunk_stats: Vec<PageEncodingStats> = chunk_page_stats
+            .iter()
+            .map(|x| crate::file::page_encoding_stats::try_from_thrift(x).unwrap())
+            .collect();
+        assert_eq!(&chunk_stats, file_page_stats);
     }
 }
