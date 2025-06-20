@@ -1220,8 +1220,8 @@ fn test_multi_threaded_encrypted_writing() {
         .collect::<Vec<RecordBatch>>();
 }
 
-#[test]
-fn test_multi_threaded_writing_3() {
+#[tokio::test]
+async fn test_multi_threaded_writing_3() {
     let temp_file = tempfile::tempfile().unwrap();
 
     // The arrow schema
@@ -1256,33 +1256,53 @@ fn test_multi_threaded_writing_3() {
     let writer_properties = arrow_writer.writer.properties().clone();
     let row_group_writer_factory = ArrowRowGroupWriterFactory::new(&arrow_writer.writer);
 
-    // let mut row_group_writer = ArrowRowGroupWriterFactory::new(&arrow_writer.writer)
-    //     // .with_file_encryptor(writer.file_encryptor())
-    //     .create_row_group_writer(&parquet_schema, &writer_properties, &schema, 0).unwrap();
+    // TODO: read data from file instead of hardcoding it
     // Create some example input columns to encode
     let to_write = vec![
         Arc::new(Int32Array::from_iter_values([1, 2, 3])) as _,
         Arc::new(Float32Array::from_iter_values([1., 45., -1.])) as _,
     ];
-
     let record_batches = vec![RecordBatch::try_new(schema.clone(), to_write).unwrap()];
+
     let mut join_set = JoinSet::new();
-    for (row_group_index, record_batch) in record_batches.iter().enumerate() {
+
+    for (row_group_index, record_batch) in record_batches.iter().map(|x| x.clone()).enumerate() {
+        // Create a row group writer for the record batch
+        let mut row_group_writer = row_group_writer_factory
+            .create_row_group_writer(
+                &parquet_schema,
+                &writer_properties,
+                &schema,
+                row_group_index,
+            )
+            .unwrap();
+
         // Spawn a thread for each record batch
         join_set.spawn(async move {
-            // Create a row group writer for the record batch
-            let mut row_group_writer = row_group_writer_factory
-                .create_row_group_writer(
-                    &parquet_schema,
-                    &writer_properties,
-                    &schema,
-                    row_group_index,
-                )
-                .unwrap();
             // Write the record batch to the row group
             row_group_writer.write(&record_batch).unwrap();
+            row_group_writer.close().unwrap();
             // Return the row group writer
-            row_group_writer
+            // row_group_writer
         });
     }
+    // Wait for all threads to complete
+    join_set.join_all().await;
+
+    let metadata = arrow_writer.close().unwrap();
+    // assert_eq!(metadata.num_rows, 3);
+
+    let options =
+        ArrowReaderOptions::default().with_file_decryption_properties(decryption_properties);
+    let reader_metadata = ArrowReaderMetadata::load(&temp_file, options.clone()).unwrap();
+    let metadata = reader_metadata.metadata();
+
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new_with_options(temp_file, options).unwrap();
+    let record_reader = builder.build().unwrap();
+    let record_batches = record_reader
+        .map(|x| x.unwrap())
+        .collect::<Vec<RecordBatch>>();
+
+    verify_encryption_test_data(record_batches, metadata);
 }
