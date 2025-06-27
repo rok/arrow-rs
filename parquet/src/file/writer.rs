@@ -161,7 +161,7 @@ pub struct SerializedFileWriter<W: Write> {
     kv_metadatas: Vec<KeyValue>,
     finished: bool,
     #[cfg(feature = "encryption")]
-    file_encryptor: Option<Arc<FileEncryptor>>,
+    pub file_encryptor: Option<Arc<FileEncryptor>>,
 }
 
 impl<W: Write> Debug for SerializedFileWriter<W> {
@@ -205,7 +205,7 @@ impl<W: Write + Send> SerializedFileWriter<W> {
     }
 
     #[cfg(feature = "encryption")]
-    fn get_file_encryptor(
+    pub fn get_file_encryptor(
         properties: &WriterPropertiesPtr,
         schema_descriptor: &SchemaDescriptor,
     ) -> Result<Option<Arc<FileEncryptor>>> {
