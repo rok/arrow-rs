@@ -1272,7 +1272,9 @@ async fn test_multi_threaded_writing_3() {
     let arrow_writer =
         ArrowWriter::try_new(&temp_file, schema.clone(), Some(props.clone())).unwrap();
     let writer_properties = arrow_writer.writer.properties().clone();
-    let row_group_writer_factory = ArrowRowGroupWriterFactory::new(&arrow_writer.writer);
+    // let row_group_writer_factory = ArrowRowGroupWriterFactory::new(&arrow_writer.writer);
+    let row_group_writer_factory = &arrow_writer.row_group_writer_factory;
+    // let arrow_writer = ArrowWriter::try_new_with_options()
 
     let mut join_set = JoinSet::new();
 
@@ -1298,7 +1300,8 @@ async fn test_multi_threaded_writing_3() {
     }
     // Wait for all threads to complete
     join_set.join_all().await;
-    // let metadata = arrow_writer.close().unwrap();
+    let metadata = arrow_writer.close().unwrap();
+    assert_eq!(metadata.num_rows, 50);
 
     let temp_file_path = temp_file.path().to_str().unwrap();
     let (record_batches_2, metadata_2) =

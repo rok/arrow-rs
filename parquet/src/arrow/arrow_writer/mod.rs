@@ -141,7 +141,7 @@ pub struct ArrowWriter<W: Write> {
     arrow_schema: SchemaRef,
 
     /// Creates new [`ArrowRowGroupWriter`] instances as required
-    row_group_writer_factory: ArrowRowGroupWriterFactory,
+    pub row_group_writer_factory: ArrowRowGroupWriterFactory,
 
     /// The length of arrays to write to each row group
     max_row_group_size: usize,
