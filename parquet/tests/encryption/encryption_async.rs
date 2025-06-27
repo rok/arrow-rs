@@ -20,21 +20,16 @@
 use crate::encryption_util::{
     verify_column_indexes, verify_encryption_test_data, TestKeyRetriever,
 };
-use arrow::compute::concat;
 use arrow_array::RecordBatch;
 use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::arrow_writer::{
-    compute_leaves, get_column_writers_with_encryptor, ArrowColumnChunk, ArrowLeafColumn,
-    ArrowWriterOptions,
-};
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
+use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::{ArrowSchemaConverter, AsyncArrowWriter};
 use parquet::encryption::decrypt::FileDecryptionProperties;
-use parquet::encryption::encrypt::{FileEncryptionProperties, FileEncryptor};
+use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use std::sync::Arc;
 use tokio::fs::File;
 

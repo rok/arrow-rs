@@ -141,7 +141,7 @@ pub struct ArrowWriter<W: Write> {
     arrow_schema: SchemaRef,
 
     /// Creates new [`ArrowRowGroupWriter`] instances as required
-    pub row_group_writer_factory: ArrowRowGroupWriterFactory,
+    row_group_writer_factory: ArrowRowGroupWriterFactory,
 
     /// The length of arrays to write to each row group
     max_row_group_size: usize,
@@ -756,7 +756,7 @@ impl ArrowColumnWriter {
 
 /// Encodes [`RecordBatch`] to a parquet row group
 pub struct ArrowRowGroupWriter {
-    pub writers: Vec<ArrowColumnWriter>,
+    writers: Vec<ArrowColumnWriter>,
     schema: SchemaRef,
     buffered_rows: usize,
 }
@@ -770,7 +770,7 @@ impl ArrowRowGroupWriter {
         }
     }
 
-    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         self.buffered_rows += batch.num_rows();
         let mut writers = self.writers.iter_mut();
         for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
