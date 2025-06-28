@@ -38,7 +38,7 @@ use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
-use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
+use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
 use std::sync::Arc;
