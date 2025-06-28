@@ -1090,16 +1090,6 @@ fn read_and_roundtrip_to_encrypted_file(
 ) {
     // read example data
     let (batches, metadata) = read_encrypted_file(path, decryption_properties.clone()).unwrap();
-    // let file = File::open(path).unwrap();
-    // let options = ArrowReaderOptions::default()
-    //     .with_file_decryption_properties(decryption_properties.clone());
-    // let metadata = ArrowReaderMetadata::load(&file, options.clone()).unwrap();
-    //
-    // let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
-    // let batch_reader = builder.build().unwrap();
-    // let batches = batch_reader
-    //     .collect::<parquet::errors::Result<Vec<RecordBatch>, _>>()
-    //     .unwrap();
 
     let temp_file = tempfile::tempfile().unwrap();
     // write example data
@@ -1158,11 +1148,10 @@ async fn test_multi_threaded_encrypted_writing() {
         .with_coerce_types(props.coerce_types())
         .convert(&schema)
         .unwrap();
+    let root_schema = parquet_schema.root_schema_ptr();
 
     // Create a temporary file to write the encrypted data
     let temp_file = tempfile::NamedTempFile::new().unwrap();
-
-    let root_schema = parquet_schema.root_schema_ptr();
     let mut file_writer =
         SerializedFileWriter::new(&temp_file, root_schema.clone(), props.clone()).unwrap();
 
@@ -1171,27 +1160,16 @@ async fn test_multi_threaded_encrypted_writing() {
     // * first make file writer then get encryptor for column writer from the file writer
     // * perhaps use ArrowRowGroupWriterFactory as the main object to
 
-    // let row_group_writer_factory = ArrowRowGroupWriterFactory::new(&file_writer);
-    // let mut row_group_writer = row_group_writer_factory
-    //     .create_row_group_writer(
-    //         &parquet_schema,
-    //         &props.clone(),
-    //         &schema,
-    //         0,
-    //     )
-    //     .unwrap();
+    let row_group_writer_factory = ArrowRowGroupWriterFactory::new(&file_writer);
+    let mut row_group_writer = row_group_writer_factory
+        .create_row_group_writer(&parquet_schema, &props.clone(), &schema, 0)
+        .unwrap();
 
-    // Create column writers with encryptor
-    let col_writers = get_column_writers_with_encryptor(
-        &parquet_schema,
-        &props,
-        &schema,
-        file_writer.file_encryptor(),
-        0,
-    )
-    .unwrap();
+    // Get column writers with encryptor
+    // let col_writers = row_group_writer.writers;
 
-    let mut workers: Vec<_> = col_writers
+    let mut workers: Vec<_> = row_group_writer
+        .writers
         .into_iter()
         .map(|mut col_writer| {
             let (send, recv) = std::sync::mpsc::channel::<ArrowLeafColumn>();

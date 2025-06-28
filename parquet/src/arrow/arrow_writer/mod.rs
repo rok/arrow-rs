@@ -130,7 +130,7 @@ mod levels;
 /// [support nanosecond intervals]: https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#interval
 pub struct ArrowWriter<W: Write> {
     /// Underlying Parquet writer
-    pub writer: SerializedFileWriter<W>,
+    writer: SerializedFileWriter<W>,
 
     /// The in-progress row group if any
     in_progress: Option<ArrowRowGroupWriter>,
@@ -756,7 +756,7 @@ impl ArrowColumnWriter {
 
 /// Encodes [`RecordBatch`] to a parquet row group
 pub struct ArrowRowGroupWriter {
-    writers: Vec<ArrowColumnWriter>,
+    pub writers: Vec<ArrowColumnWriter>,
     schema: SchemaRef,
     buffered_rows: usize,
 }
