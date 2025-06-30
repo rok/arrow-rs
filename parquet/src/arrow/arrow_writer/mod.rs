@@ -555,7 +555,7 @@ impl PageWriter for ArrowPageWriter {
 }
 
 /// A leaf column that can be encoded by [`ArrowColumnWriter`]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrowLeafColumn(ArrayLevels);
 
 /// Computes the [`ArrowLeafColumn`] for a potentially nested [`ArrayRef`]

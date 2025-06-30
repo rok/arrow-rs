@@ -41,7 +41,9 @@ use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
+use std::ops::Deref;
 use std::sync::Arc;
+use arrow::util::bench_util::create_primitive_array;
 
 #[test]
 fn test_non_uniform_encryption_plaintext_footer() {
@@ -1161,47 +1163,106 @@ async fn test_multi_threaded_encrypted_writing() {
     // Get column writers with encryptor from ArrowRowGroupWriter
     let col_writers = arrow_row_group_writer.writers;
 
-    let mut workers: Vec<_> = col_writers
-        .into_iter()
-        .map(|mut col_writer| {
-            let (send, recv) = std::sync::mpsc::channel::<ArrowLeafColumn>();
-            let handle = std::thread::spawn(move || {
-                // receive Arrays to encode via the channel
-                for col in recv {
-                    col_writer.write(&col)?;
-                }
-                // once the input is complete, close the writer
-                // to return the newly created ArrowColumnChunk
-                col_writer.close()
-            });
-            (handle, send)
-        })
-        .collect();
+    let num_columns = col_writers.len();
 
-    let mut worker_iter = workers.iter_mut();
-    for (arr, field) in to_write.iter().zip(&schema.fields) {
-        for leaves in compute_leaves(field, arr).unwrap() {
-            worker_iter.next().unwrap().1.send(leaves).unwrap();
+    // let tasks = tokio::task::JoinSet::new();
+    let mut col_writer_tasks = Vec::with_capacity(num_columns);
+    let mut col_array_channels = Vec::with_capacity(num_columns);
+    for mut writer in col_writers.into_iter() {
+        // Buffer size of this channel limits the number of arrays queued up for column level serialization
+        let (send_array, mut receive_array) =
+            tokio::sync::mpsc::channel::<ArrowLeafColumn>(
+            100, // Buffer size
+            );
+        col_array_channels.push(send_array);
+        let handle = tokio::spawn(async move {
+            for col in receive_array.recv().await {
+                writer.write(&col);
+            }
+            writer.close().unwrap()
+        });
+        col_writer_tasks.push(handle);
+    }
+
+    let mut next_channel = 0;
+    for (array, field) in to_write.iter().zip(schema.fields()) {
+        for c in compute_leaves(field, array) {
+            // Do not surface error from closed channel (means something
+            // else hit an error, and the plan is shutting down).
+            for cc in c.iter() {
+                if col_array_channels[next_channel].send(cc.clone()).await.is_err() {
+                    continue;
+                }
+            }
+
+            next_channel += 1;
         }
     }
 
-    // Wait for the workers to complete encoding, and append
-    // the resulting column chunks to the row group (and the file)
-    let mut row_group_writer = file_writer.next_row_group().unwrap();
+    // while let Some(task) = serialize_rx.recv().await {
+    //     let result = task.join_unwind().await;
+    //     let mut rg_out = parquet_writer.next_row_group()?;
+    //     let (serialized_columns, mut rg_reservation, _cnt) =
+    //         result.map_err(DataFusionError::ExecutionJoin)??;
+    //     for chunk in serialized_columns {
+    //         chunk.append_to_row_group(&mut rg_out)?;
+    //         rg_reservation.free();
+    // 
+    //         let mut buff_to_flush = merged_buff.buffer.try_lock().unwrap();
+    //         file_reservation.try_resize(buff_to_flush.len())?;
+    // 
+    //         if buff_to_flush.len() > BUFFER_FLUSH_BYTES {
+    //             object_store_writer
+    //                 .write_all(buff_to_flush.as_slice())
+    //                 .await?;
+    //             buff_to_flush.clear();
+    //             file_reservation.try_resize(buff_to_flush.len())?; // will set to zero
+    //         }
+    //     }
+    //     rg_out.close()?;
+    // }
 
-    for (handle, send) in workers {
-        drop(send); // Drop send side to signal termination
-                    // wait for the worker to send the completed chunk
-        let chunk: ArrowColumnChunk = handle.join().unwrap().unwrap();
-        chunk.append_to_row_group(&mut row_group_writer).unwrap();
-    }
-    // Close the row group which writes to the underlying file
-    row_group_writer.close().unwrap();
-
+    // let mut workers: Vec<_> = col_writers
+    //     .into_iter()
+    //     .map(|mut col_writer| {
+    //         let (send, recv) = std::sync::mpsc::channel::<ArrowLeafColumn>();
+    //         let handle = std::thread::spawn(move || {
+    //             // receive Arrays to encode via the channel
+    //             for col in recv {
+    //                 col_writer.write(&col)?;
+    //             }
+    //             // once the input is complete, close the writer
+    //             // to return the newly created ArrowColumnChunk
+    //             col_writer.close()
+    //         });
+    //         (handle, send)
+    //     })
+    //     .collect();
+    //
+    // let mut worker_iter = workers.iter_mut();
+    // for (arr, field) in to_write.iter().zip(&schema.fields) {
+    //     for leaves in compute_leaves(field, arr).unwrap() {
+    //         worker_iter.next().unwrap().1.send(leaves).unwrap();
+    //     }
+    // }
+    //
+    // // Wait for the workers to complete encoding, and append
+    // // the resulting column chunks to the row group (and the file)
+    // let mut row_group_writer = file_writer.next_row_group().unwrap();
+    //
+    // for (handle, send) in workers {
+    //     drop(send); // Drop send side to signal termination
+    //                 // wait for the worker to send the completed chunk
+    //     let chunk: ArrowColumnChunk = handle.join().unwrap().unwrap();
+    //     chunk.append_to_row_group(&mut row_group_writer).unwrap();
+    // }
+    // // Close the row group which writes to the underlying file
+    // row_group_writer.close().unwrap();
+    //
     // Close the file writer which writes the footer
     let metadata = file_writer.close().unwrap();
     assert_eq!(metadata.num_rows, 50);
-
+    
     // Check that the file was written correctly
     let (read_record_batches, read_metadata) = read_encrypted_file(
         temp_file.path().to_str().unwrap(),
@@ -1209,7 +1270,7 @@ async fn test_multi_threaded_encrypted_writing() {
     )
     .unwrap();
     verify_encryption_test_data(read_record_batches, read_metadata.metadata());
-
+    
     // Check that file was encrypted
     let result = ArrowReaderMetadata::load(&temp_file.into_file(), ArrowReaderOptions::default());
     assert_eq!(
