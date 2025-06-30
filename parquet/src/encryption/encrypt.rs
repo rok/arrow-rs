@@ -288,7 +288,7 @@ impl EncryptionPropertiesBuilder {
 
 #[derive(Debug)]
 /// The encryption configuration for a single Parquet file
-pub struct FileEncryptor {
+pub(crate) struct FileEncryptor {
     properties: FileEncryptionProperties,
     aad_file_unique: Vec<u8>,
     file_aad: Vec<u8>,
