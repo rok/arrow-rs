@@ -318,6 +318,7 @@ fn print_logical_and_converted(
             LogicalType::Enum => "ENUM".to_string(),
             LogicalType::List => "LIST".to_string(),
             LogicalType::Map => "MAP".to_string(),
+            LogicalType::Vector => "VECTOR".to_string(),
             LogicalType::Float16 => "FLOAT16".to_string(),
             LogicalType::Variant(VariantType {
                 specification_version,
@@ -384,10 +385,11 @@ impl Printer<'_> {
                     }
                     _ => format!("{physical_type}"),
                 };
+                let repetition_str = format!("{}", basic_info.repetition());
                 write!(
                     self.output,
                     "{} {} {}",
-                    basic_info.repetition(),
+                    repetition_str,
                     phys_type_str,
                     basic_info.name()
                 );
@@ -411,6 +413,7 @@ impl Printer<'_> {
             Type::GroupType {
                 ref basic_info,
                 ref fields,
+                vector_length,
             } => {
                 if basic_info.has_repetition() {
                     write!(
@@ -419,6 +422,9 @@ impl Printer<'_> {
                         basic_info.repetition(),
                         basic_info.name()
                     );
+                    if let Some(n) = vector_length {
+                        write!(self.output, "[{n}] ");
+                    }
                     if basic_info.has_id() {
                         write!(self.output, "[{}] ", basic_info.id());
                     }

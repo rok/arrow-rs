@@ -350,6 +350,8 @@ pub struct PageMetadata {
     pub num_rows: Option<usize>,
     /// The number of levels within the page if known
     pub num_levels: Option<usize>,
+    /// The number of null values within the page if known
+    pub num_nulls: Option<usize>,
     /// Returns true if the page is a dictionary page
     pub is_dict: bool,
 }
@@ -366,12 +368,14 @@ impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
                 Ok(PageMetadata {
                     num_rows: None,
                     num_levels: Some(header.num_values as _),
+                    num_nulls: None,
                     is_dict: false,
                 })
             }
             PageType::DICTIONARY_PAGE => Ok(PageMetadata {
                 num_rows: None,
                 num_levels: None,
+                num_nulls: None,
                 is_dict: true,
             }),
             PageType::DATA_PAGE_V2 => {
@@ -379,6 +383,7 @@ impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
                 Ok(PageMetadata {
                     num_rows: Some(header.num_rows as _),
                     num_levels: Some(header.num_values as _),
+                    num_nulls: Some(header.num_nulls as _),
                     is_dict: false,
                 })
             }

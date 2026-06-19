@@ -84,7 +84,15 @@ impl<'a> Tokenizer<'a> {
 
     // List of all special characters in schema
     fn is_schema_delim(c: char) -> bool {
-        c == ';' || c == '{' || c == '}' || c == '(' || c == ')' || c == '=' || c == ','
+        c == ';'
+            || c == '{'
+            || c == '}'
+            || c == '('
+            || c == ')'
+            || c == '='
+            || c == ','
+            || c == '['
+            || c == ']'
     }
 
     /// Splits string into tokens; input string can already be token or can contain
@@ -244,43 +252,71 @@ impl Parser<'_> {
             .next()
             .ok_or_else(|| general_err!("Expected name, found None"))?;
 
-        // Parse logical or converted type if exists
-        let (logical_type, converted_type) = if let Some("(") = self.tokenizer.next() {
-            let tpe = self
-                .tokenizer
-                .next()
-                .ok_or_else(|| general_err!("Expected converted type, found None"))
-                .and_then(|v| {
-                    // Try logical type first
-                    let upper = v.to_uppercase();
-                    let logical = upper.parse::<LogicalType>();
-                    match logical {
-                        Ok(logical) => {
-                            Ok((Some(logical.clone()), ConvertedType::from(Some(logical))))
-                        }
-                        Err(_) => Ok((None, upper.parse::<ConvertedType>()?)),
-                    }
-                })?;
-            assert_token(self.tokenizer.next(), ")")?;
-            tpe
+        // A VECTOR-repeated middle group carries its fixed length after the name,
+        // e.g. `VECTOR group list [768] { ... }`.
+        let vector_length = if repetition == Some(Repetition::VECTOR) {
+            assert_token(self.tokenizer.next(), "[")?;
+            let n = parse_i32(
+                self.tokenizer.next(),
+                "Expected vector length, found None",
+                "Failed to parse vector length for VECTOR repetition",
+            )?;
+            assert_token(self.tokenizer.next(), "]")?;
+            Some(n)
         } else {
-            self.tokenizer.backtrack();
-            (None, ConvertedType::NONE)
-        };
-
-        // Parse optional id
-        let id = if let Some("=") = self.tokenizer.next() {
-            self.tokenizer.next().and_then(|v| v.parse::<i32>().ok())
-        } else {
-            self.tokenizer.backtrack();
             None
         };
+
+        // Parse optional logical/converted type and optional id. The printer emits
+        // group ids before logical types (`group f [1] (LIST)`), while existing
+        // parser inputs may use logical-before-id (`group f (LIST) [1]`), so accept
+        // either order.
+        let mut logical_type = None;
+        let mut converted_type = ConvertedType::NONE;
+        let mut id = None;
+        loop {
+            match self.tokenizer.next() {
+                Some("(") if logical_type.is_none() && converted_type == ConvertedType::NONE => {
+                    let tpe = self
+                        .tokenizer
+                        .next()
+                        .ok_or_else(|| general_err!("Expected converted type, found None"))
+                        .and_then(|v| {
+                            // Try logical type first
+                            let upper = v.to_uppercase();
+                            let logical = upper.parse::<LogicalType>();
+                            match logical {
+                                Ok(logical) => {
+                                    Ok((Some(logical.clone()), ConvertedType::from(Some(logical))))
+                                }
+                                Err(_) => Ok((None, upper.parse::<ConvertedType>()?)),
+                            }
+                        })?;
+                    assert_token(self.tokenizer.next(), ")")?;
+                    logical_type = tpe.0;
+                    converted_type = tpe.1;
+                }
+                Some("=") if id.is_none() => {
+                    id = self.tokenizer.next().and_then(|v| v.parse::<i32>().ok());
+                }
+                Some("[") if id.is_none() => {
+                    id = self.tokenizer.next().and_then(|v| v.parse::<i32>().ok());
+                    assert_token(self.tokenizer.next(), "]")?;
+                }
+                Some(_) => {
+                    self.tokenizer.backtrack();
+                    break;
+                }
+                None => break,
+            }
+        }
 
         let mut builder = Type::group_type_builder(name)
             .with_logical_type(logical_type)
             .with_converted_type(converted_type)
             .with_fields(self.parse_child_types()?)
-            .with_id(id);
+            .with_id(id)
+            .with_vector_length(vector_length);
         if let Some(rep) = repetition {
             builder = builder.with_repetition(rep);
         }
@@ -310,10 +346,26 @@ impl Parser<'_> {
             .next()
             .ok_or_else(|| general_err!("Expected name, found None"))?;
 
+        // Parse optional id before logical/converted type. The printer emits
+        // primitive ids before logical annotations (`INT32 f [1] (INT_32)`),
+        // while existing parser inputs may use logical-before-id.
+        let mut id = None;
+        let mut next = self.tokenizer.next();
+        match next {
+            Some("=") => {
+                id = self.tokenizer.next().and_then(|v| v.parse::<i32>().ok());
+                next = self.tokenizer.next();
+            }
+            Some("[") => {
+                id = self.tokenizer.next().and_then(|v| v.parse::<i32>().ok());
+                assert_token(self.tokenizer.next(), "]")?;
+                next = self.tokenizer.next();
+            }
+            _ => {}
+        }
+
         // Parse converted type
-        let (logical_type, converted_type, precision, scale) = if let Some("(") =
-            self.tokenizer.next()
-        {
+        let (logical_type, converted_type, precision, scale) = if next == Some("(") {
             let (mut logical, mut converted) = self
                 .tokenizer
                 .next()
@@ -485,13 +537,22 @@ impl Parser<'_> {
             (None, ConvertedType::NONE, -1, -1)
         };
 
-        // Parse optional id
-        let id = if let Some("=") = self.tokenizer.next() {
-            self.tokenizer.next().and_then(|v| v.parse::<i32>().ok())
-        } else {
-            self.tokenizer.backtrack();
-            None
-        };
+        // Parse optional id after logical/converted type (both `= 1` and
+        // printer-style `[1]` are accepted).
+        if id.is_none() {
+            id = match self.tokenizer.next() {
+                Some("=") => self.tokenizer.next().and_then(|v| v.parse::<i32>().ok()),
+                Some("[") => {
+                    let id = self.tokenizer.next().and_then(|v| v.parse::<i32>().ok());
+                    assert_token(self.tokenizer.next(), "]")?;
+                    id
+                }
+                _ => {
+                    self.tokenizer.backtrack();
+                    None
+                }
+            };
+        }
         assert_token(self.tokenizer.next(), ";")?;
 
         Type::primitive_type_builder(name, physical_type)
@@ -517,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_delimiters() {
-        let mut iter = Tokenizer::from_str(",;{}()=");
+        let mut iter = Tokenizer::from_str(",;{}()=[]");
         assert_eq!(iter.next(), Some(","));
         assert_eq!(iter.next(), Some(";"));
         assert_eq!(iter.next(), Some("{"));
@@ -525,12 +586,14 @@ mod tests {
         assert_eq!(iter.next(), Some("("));
         assert_eq!(iter.next(), Some(")"));
         assert_eq!(iter.next(), Some("="));
+        assert_eq!(iter.next(), Some("["));
+        assert_eq!(iter.next(), Some("]"));
         assert_eq!(iter.next(), None);
     }
 
     #[test]
     fn test_tokenize_delimiters_with_whitespaces() {
-        let mut iter = Tokenizer::from_str(" , ; { } ( ) = ");
+        let mut iter = Tokenizer::from_str(" , ; { } ( ) = [ ] ");
         assert_eq!(iter.next(), Some(","));
         assert_eq!(iter.next(), Some(";"));
         assert_eq!(iter.next(), Some("{"));
@@ -538,6 +601,8 @@ mod tests {
         assert_eq!(iter.next(), Some("("));
         assert_eq!(iter.next(), Some(")"));
         assert_eq!(iter.next(), Some("="));
+        assert_eq!(iter.next(), Some("["));
+        assert_eq!(iter.next(), Some("]"));
         assert_eq!(iter.next(), None);
     }
 
@@ -1089,5 +1154,66 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn test_parse_and_print_vector() {
+        use crate::schema::printer::print_schema;
+
+        let schema_str = "
+        message schema {
+            REQUIRED group embedding (VECTOR) [42] {
+              VECTOR group list [768] {
+                REQUIRED FLOAT element;
+              }
+            }
+            REQUIRED INT32 id;
+        }
+        ";
+        let parsed = parse_message_type(schema_str).unwrap();
+        let vector = &parsed.get_fields()[0];
+        assert_eq!(
+            vector.get_basic_info().logical_type_ref(),
+            Some(&LogicalType::Vector)
+        );
+        assert_eq!(vector.get_basic_info().id(), 42);
+        let list = &vector.get_fields()[0];
+        assert_eq!(list.get_basic_info().repetition(), Repetition::VECTOR);
+        assert_eq!(list.vector_length(), Some(768));
+
+        // The printed schema must round-trip back through the parser.
+        let mut buf = Vec::new();
+        print_schema(&mut buf, &parsed);
+        let printed = String::from_utf8(buf).unwrap();
+        let reparsed = parse_message_type(&printed).unwrap();
+        assert_eq!(parsed, reparsed);
+
+        // An FLBA element prints both the VECTOR length and the FLBA type length.
+        let flba = parse_message_type(
+            "message schema { REQUIRED group ids (VECTOR) { VECTOR group list [4] { REQUIRED FIXED_LEN_BYTE_ARRAY (16) element; } } }",
+        )
+        .unwrap();
+        let list = &flba.get_fields()[0].get_fields()[0];
+        assert_eq!(list.vector_length(), Some(4));
+        match list.get_fields()[0].as_ref() {
+            Type::PrimitiveType { type_length, .. } => assert_eq!(*type_length, 16),
+            _ => panic!("expected a primitive VECTOR element"),
+        }
+        let mut buf = Vec::new();
+        print_schema(&mut buf, &flba);
+        let reparsed = parse_message_type(&String::from_utf8(buf).unwrap()).unwrap();
+        assert_eq!(flba, reparsed);
+
+        // Primitive element ids printed before logical annotations also round-trip.
+        let id_before_logical = parse_message_type(
+            "message schema { REQUIRED group v (VECTOR) { VECTOR group list [2] { REQUIRED INT32 element [7] (INT_32); } } }",
+        )
+        .unwrap();
+        let element = &id_before_logical.get_fields()[0].get_fields()[0].get_fields()[0];
+        assert_eq!(element.get_basic_info().id(), 7);
+        let mut buf = Vec::new();
+        print_schema(&mut buf, &id_before_logical);
+        let reparsed = parse_message_type(&String::from_utf8(buf).unwrap()).unwrap();
+        assert_eq!(id_before_logical, reparsed);
     }
 }

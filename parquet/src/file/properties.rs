@@ -68,6 +68,8 @@ pub const DEFAULT_STATISTICS_TRUNCATE_LENGTH: Option<usize> = Some(64);
 pub const DEFAULT_OFFSET_INDEX_DISABLED: bool = false;
 /// Default values for [`WriterProperties::coerce_types`]
 pub const DEFAULT_COERCE_TYPES: bool = false;
+/// Default values for [`WriterProperties::vector_encoding`]
+pub const DEFAULT_VECTOR_ENCODING: bool = false;
 /// Default value for [`WriterProperties::data_page_v2_compression_ratio_threshold`]
 pub const DEFAULT_DATA_PAGE_V2_COMPRESSION_RATIO_THRESHOLD: f64 = 1.0;
 /// Default value for [`WriterProperties::write_path_in_schema`]
@@ -254,6 +256,7 @@ pub struct WriterProperties {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
+    vector_encoding: bool,
     content_defined_chunking: Option<CdcOptions>,
     write_path_in_schema: bool,
     #[cfg(feature = "encryption")]
@@ -441,6 +444,14 @@ impl WriterProperties {
         self.coerce_types
     }
 
+    /// Returns `true` if EXPERIMENTAL VECTOR encoding of eligible Arrow
+    /// `FixedSizeList` columns is enabled.
+    ///
+    /// For more details see [`WriterPropertiesBuilder::set_vector_encoding`]
+    pub fn vector_encoding(&self) -> bool {
+        self.vector_encoding
+    }
+
     /// Returns `true` if the `path_in_schema` field of the `ColumnMetaData` Thrift struct
     /// should be written.
     ///
@@ -603,6 +614,7 @@ pub struct WriterPropertiesBuilder {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
+    vector_encoding: bool,
     content_defined_chunking: Option<CdcOptions>,
     write_path_in_schema: bool,
     #[cfg(feature = "encryption")]
@@ -628,6 +640,7 @@ impl Default for WriterPropertiesBuilder {
             column_index_truncate_length: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             statistics_truncate_length: DEFAULT_STATISTICS_TRUNCATE_LENGTH,
             coerce_types: DEFAULT_COERCE_TYPES,
+            vector_encoding: DEFAULT_VECTOR_ENCODING,
             content_defined_chunking: None,
             write_path_in_schema: DEFAULT_WRITE_PATH_IN_SCHEMA,
             #[cfg(feature = "encryption")]
@@ -683,6 +696,7 @@ impl WriterPropertiesBuilder {
             column_index_truncate_length: self.column_index_truncate_length,
             statistics_truncate_length: self.statistics_truncate_length,
             coerce_types: self.coerce_types,
+            vector_encoding: self.vector_encoding,
             content_defined_chunking: self.content_defined_chunking,
             write_path_in_schema: self.write_path_in_schema,
             #[cfg(feature = "encryption")]
@@ -897,6 +911,48 @@ impl WriterPropertiesBuilder {
     /// [`ArrowToParquetSchemaConverter::with_coerce_types`]: crate::arrow::ArrowSchemaConverter::with_coerce_types
     pub fn set_coerce_types(mut self, coerce_types: bool) -> Self {
         self.coerce_types = coerce_types;
+        self
+    }
+
+    /// EXPERIMENTAL: enable encoding eligible Arrow `FixedSizeList` columns using
+    /// the Parquet `VECTOR` logical type / repetition type instead of the standard
+    /// 3-level `LIST` encoding. Defaults to `false` via [`DEFAULT_VECTOR_ENCODING`].
+    ///
+    /// Only a top-level, non-nullable `FixedSizeList` with a positive size and a
+    /// non-nullable fixed-width primitive element is encoded as `VECTOR`; every
+    /// other `FixedSizeList` (nullable, nested, zero-length, or with a
+    /// variable-width/nullable element) transparently falls back to the standard
+    /// `LIST` encoding.
+    ///
+    /// `VECTOR` is not yet part of apache/parquet-format and is identified on disk
+    /// by an outer `LogicalType::VECTOR` group containing a `FieldRepetitionType::VECTOR`
+    /// middle group with `SchemaElement::vector_length`. Files written with `VECTOR`
+    /// are **not** readable by Parquet implementations that do not understand the
+    /// `VECTOR` repetition type. Only enable this for consumers known to support it.
+    ///
+    /// This writer keeps every data page on a whole-vector boundary, and the reader
+    /// requires that invariant: a `VECTOR` column whose page splits a vector value
+    /// is rejected on read. Interop is therefore guaranteed only with writers that
+    /// also align pages to vector boundaries.
+    ///
+    /// Note: page/column statistics (min/max/null_count), page-index bounds, and
+    /// bloom filters are computed over the flattened *element* values, not over
+    /// whole vector values.
+    ///
+    /// When read back without the embedded Arrow schema (self-describing), the
+    /// reconstructed `FixedSizeList` child field is named `"element"` (matching the
+    /// Parquet LIST element convention and the Option B proposal). With the
+    /// embedded Arrow schema present, the original child field name is preserved.
+    ///
+    /// Performance: row-level skipping (`RowSelection` / predicate pushdown) over a
+    /// VECTOR column delegates to the leaf column reader. When page metadata carries
+    /// the required value counts, whole pages are skipped without decoding and only
+    /// the residual within a partially-selected page is skipped at the decoder level
+    /// — the same characteristics as an ordinary column. If offset-index metadata is
+    /// incomplete, the reader may read the page to validate VECTOR invariants before
+    /// deciding whether it can be skipped.
+    pub fn set_vector_encoding(mut self, vector_encoding: bool) -> Self {
+        self.vector_encoding = vector_encoding;
         self
     }
 
@@ -1346,6 +1402,7 @@ impl From<WriterProperties> for WriterPropertiesBuilder {
             column_index_truncate_length: props.column_index_truncate_length,
             statistics_truncate_length: props.statistics_truncate_length,
             coerce_types: props.coerce_types,
+            vector_encoding: props.vector_encoding,
             content_defined_chunking: props.content_defined_chunking,
             write_path_in_schema: props.write_path_in_schema,
             #[cfg(feature = "encryption")]

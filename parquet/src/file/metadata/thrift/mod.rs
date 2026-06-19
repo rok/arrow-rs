@@ -100,6 +100,11 @@ pub(crate) struct SchemaElement<'a> {
   /// LogicalType replaces ConvertedType, but ConvertedType is still required
   /// for some logical types to ensure forward-compatibility in format v1.
   10: optional LogicalType logical_type
+  /// EXPERIMENTAL: the fixed number of element slots per parent occurrence when
+  /// `repetition_type` is `VECTOR`. MUST be set and positive when the repetition
+  /// is `VECTOR`, and MUST NOT be set otherwise. Field id 11 matches the
+  /// apache/parquet-format VECTOR proposal.
+  11: optional i32 vector_length
 }
 );
 
@@ -1530,10 +1535,15 @@ fn write_schema_helper<W: Write>(
                     None
                 },
                 logical_type: basic_info.logical_type_ref().cloned(),
+                vector_length: None,
             };
             element.write_thrift(writer)
         }
-        crate::schema::types::Type::GroupType { basic_info, fields } => {
+        crate::schema::types::Type::GroupType {
+            basic_info,
+            fields,
+            vector_length,
+        } => {
             let repetition = if basic_info.has_repetition() {
                 Some(basic_info.repetition())
             } else {
@@ -1558,6 +1568,7 @@ fn write_schema_helper<W: Write>(
                     None
                 },
                 logical_type: basic_info.logical_type_ref().cloned(),
+                vector_length: *vector_length,
             };
 
             element.write_thrift(writer)?;

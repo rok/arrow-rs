@@ -42,7 +42,6 @@ use crate::arrow::ProjectionMask;
 use crate::arrow::schema::extension::{
     has_extension_type, logical_type_for_binary, logical_type_for_binary_view,
     logical_type_for_fixed_size_binary, logical_type_for_string, logical_type_for_struct,
-    try_add_extension_type,
 };
 pub(crate) use complex::{ParquetField, ParquetFieldType, VirtualColumnType};
 
@@ -422,6 +421,11 @@ pub struct ArrowSchemaConverter<'a> {
     ///
     /// See docs on [Self::with_coerce_types]`
     coerce_types: bool,
+    /// Should eligible top-level `FixedSizeList` columns be encoded using the
+    /// Parquet `VECTOR` logical/repetition types?
+    ///
+    /// See docs on [Self::with_vector_encoding]
+    vector_encoding: bool,
 }
 
 impl Default for ArrowSchemaConverter<'_> {
@@ -436,6 +440,7 @@ impl<'a> ArrowSchemaConverter<'a> {
         Self {
             schema_root: "arrow_schema",
             coerce_types: false,
+            vector_encoding: false,
         }
     }
 
@@ -474,6 +479,22 @@ impl<'a> ArrowSchemaConverter<'a> {
         self
     }
 
+    /// EXPERIMENTAL: encode eligible top-level Arrow `FixedSizeList` columns using
+    /// the Parquet `VECTOR` logical type / repetition type instead of the standard
+    /// 3-level `LIST` encoding (default `false`).
+    ///
+    /// Only a non-nullable `FixedSizeList` with a positive size and a non-nullable
+    /// fixed-width primitive element qualifies; all other `FixedSizeList` columns
+    /// fall back to the `LIST` encoding. See
+    /// [`WriterPropertiesBuilder::set_vector_encoding`] for the on-disk format and
+    /// compatibility caveats.
+    ///
+    /// [`WriterPropertiesBuilder::set_vector_encoding`]: crate::file::properties::WriterPropertiesBuilder::set_vector_encoding
+    pub fn with_vector_encoding(mut self, vector_encoding: bool) -> Self {
+        self.vector_encoding = vector_encoding;
+        self
+    }
+
     /// Set the root schema element name (defaults to `"arrow_schema"`).
     pub fn schema_root(mut self, schema_root: &'a str) -> Self {
         self.schema_root = schema_root;
@@ -487,13 +508,160 @@ impl<'a> ArrowSchemaConverter<'a> {
         let fields = schema
             .fields()
             .iter()
-            .map(|field| arrow_to_parquet_type(field, self.coerce_types).map(Arc::new))
+            .map(|field| {
+                // EXPERIMENTAL: the VECTOR decision is made here, at the top level
+                // only, so we only ever produce dense (no nullable/repeated
+                // ancestor) vectors. Nested `FixedSizeList`s go through the normal
+                // `LIST` path inside `arrow_to_parquet_type`.
+                if self.vector_encoding {
+                    if let Some((element, len)) = vector_eligible_fixed_size_list(field) {
+                        return fixed_size_list_to_vector_type(
+                            field,
+                            element,
+                            len,
+                            self.coerce_types,
+                        )
+                        .map(Arc::new);
+                    }
+                }
+                arrow_to_parquet_type(field, self.coerce_types).map(Arc::new)
+            })
             .collect::<Result<_>>()?;
         let group = Type::group_type_builder(self.schema_root)
             .with_fields(fields)
             .build()?;
         Ok(SchemaDescriptor::new(Arc::new(group)))
     }
+}
+
+/// Returns `Some((element_field, len))` when `field` is a top-level Arrow
+/// `FixedSizeList` eligible for the Parquet `VECTOR` encoding: a non-nullable
+/// list with a positive size whose element is a non-nullable, fixed-width
+/// primitive. Returns `None` otherwise (caller falls back to `LIST`).
+///
+/// Shared by the schema converter and the write-side level builder so both make
+/// the identical encoding decision.
+pub(crate) fn vector_eligible_fixed_size_list(field: &Field) -> Option<(&FieldRef, i32)> {
+    if field.is_nullable() {
+        return None;
+    }
+    match field.data_type() {
+        DataType::FixedSizeList(element, len)
+            if *len > 0
+                && !element.is_nullable()
+                && is_supported_vector_element_type(element.data_type()) =>
+        {
+            Some((element, *len))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an Arrow `FixedSizeList` element type can be encoded as a Parquet
+/// `VECTOR` element in this implementation: only fixed-width primitive elements
+/// qualify. Variable-width (Utf8/Binary), view, nested, and null types
+/// are excluded and use the standard `LIST` encoding instead.
+///
+/// Note: this is a structural check. If an otherwise-eligible element type has no
+/// Parquet primitive mapping (so [`arrow_to_parquet_type`] errors — e.g. a future
+/// `Interval` subtype), the VECTOR write surfaces that as an error rather than
+/// silently falling back to `LIST`; the standard `LIST` encoding of the same
+/// element would fail identically, so this is not a behavioral difference.
+fn is_supported_vector_element_type(dt: &DataType) -> bool {
+    use DataType::*;
+    matches!(
+        dt,
+        Boolean
+            | Int8
+            | Int16
+            | Int32
+            | Int64
+            | UInt8
+            | UInt16
+            | UInt32
+            | UInt64
+            | Float16
+            | Float32
+            | Float64
+            | Decimal32(_, _)
+            | Decimal64(_, _)
+            | Decimal128(_, _)
+            | Decimal256(_, _)
+            | Date32
+            | Date64
+            | Time32(_)
+            | Time64(_)
+            | Timestamp(_, _)
+            | Duration(_)
+            | Interval(_)
+            | FixedSizeBinary(_)
+    )
+}
+
+/// Builds the canonical 3-level Parquet `VECTOR` encoding for an eligible Arrow
+/// `FixedSizeList` field:
+///
+/// ```text
+/// required group <field> (VECTOR) {
+///   vector group list [N] {
+///     required <element-type> element;
+///   }
+/// }
+/// ```
+///
+/// The element's physical/logical type is derived using the normal primitive
+/// mapping. The VECTOR-repeated middle group carries `vector_length` and adds no
+/// definition or repetition level.
+fn fixed_size_list_to_vector_type(
+    field: &Field,
+    element: &FieldRef,
+    len: i32,
+    coerce_types: bool,
+) -> Result<Type> {
+    let name = field.name().as_str();
+    // Map the element to a Parquet primitive named `element`. Preserve the
+    // element metadata so metadata-driven mappings (e.g. the UUID extension on
+    // FixedSizeBinary(16)) match the standard LIST encoding.
+    let element_field = Field::new("element", element.data_type().clone(), false)
+        .with_metadata(element.metadata().clone());
+    let element_type = arrow_to_parquet_type(&element_field, coerce_types)?;
+    let Type::PrimitiveType {
+        basic_info,
+        physical_type,
+        type_length,
+        scale,
+        precision,
+        ..
+    } = element_type
+    else {
+        return Err(arrow_err!(
+            "VECTOR element of field '{}' did not map to a Parquet primitive type",
+            name
+        ));
+    };
+
+    let element_leaf = Type::primitive_type_builder("element", physical_type)
+        .with_repetition(Repetition::REQUIRED)
+        .with_length(type_length)
+        .with_precision(precision)
+        .with_scale(scale)
+        .with_logical_type(basic_info.logical_type_ref().cloned())
+        .with_converted_type(basic_info.converted_type())
+        .with_id(field_id(element.as_ref()))
+        .build()?;
+
+    let list = Type::group_type_builder("list")
+        .with_repetition(Repetition::VECTOR)
+        .with_vector_length(Some(len))
+        .with_fields(vec![Arc::new(element_leaf)])
+        .build()?;
+
+    Type::group_type_builder(name)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(Some(LogicalType::Vector))
+        .with_fields(vec![Arc::new(list)])
+        .with_id(field_id(field))
+        .build()
 }
 
 fn parse_key_value_metadata(
@@ -541,7 +709,7 @@ pub fn parquet_to_arrow_field(parquet_column: &ColumnDescriptor) -> Result<Field
             basic_info.id().to_string(),
         );
     }
-    try_add_extension_type(ret, parquet_column.self_type())
+    complex::add_extension_type(ret, parquet_column.self_type())
 }
 
 pub fn decimal_length_from_precision(precision: u8) -> usize {

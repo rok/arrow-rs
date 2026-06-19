@@ -66,6 +66,10 @@ pub enum Type {
         basic_info: BasicTypeInfo,
         /// Fields of this group type.
         fields: Vec<TypePtr>,
+        /// EXPERIMENTAL: number of element slots per parent occurrence when this
+        /// group has `Repetition::VECTOR`. `Some(n)` with `n > 0` iff the
+        /// repetition is `VECTOR`; `None` otherwise.
+        vector_length: Option<i32>,
     },
 }
 
@@ -73,7 +77,9 @@ impl HeapSize for Type {
     fn heap_size(&self) -> usize {
         match self {
             Type::PrimitiveType { basic_info, .. } => basic_info.heap_size(),
-            Type::GroupType { basic_info, fields } => basic_info.heap_size() + fields.heap_size(),
+            Type::GroupType {
+                basic_info, fields, ..
+            } => basic_info.heap_size() + fields.heap_size(),
         }
     }
 }
@@ -203,9 +209,14 @@ impl Type {
 
     /// Returns `true` if this type is repeated or optional.
     /// If this type doesn't have repetition defined, we treat it as required.
+    /// `VECTOR` repetition itself contributes no nullability; nullable vectors are
+    /// represented by the outer `LogicalType::Vector` group.
     pub fn is_optional(&self) -> bool {
         self.get_basic_info().has_repetition()
-            && self.get_basic_info().repetition() != Repetition::REQUIRED
+            && matches!(
+                self.get_basic_info().repetition(),
+                Repetition::OPTIONAL | Repetition::REPEATED
+            )
     }
 
     /// Returns `true` if this type is annotated as a list.
@@ -229,6 +240,15 @@ impl Type {
                 && children[0].get_basic_info().repetition() == Repetition::REPEATED;
         }
         false
+    }
+
+    /// EXPERIMENTAL: returns the fixed vector length when this type is a
+    /// `Repetition::VECTOR` group, or `None` otherwise.
+    pub fn vector_length(&self) -> Option<i32> {
+        match self {
+            Type::PrimitiveType { .. } => None,
+            Type::GroupType { vector_length, .. } => *vector_length,
+        }
     }
 }
 
@@ -349,7 +369,7 @@ impl<'a> PrimitiveTypeBuilder<'a> {
             }
             // Check that logical type and physical type are compatible
             match (logical_type, self.physical_type) {
-                (LogicalType::Map, _) | (LogicalType::List, _) => {
+                (LogicalType::Map, _) | (LogicalType::List, _) | (LogicalType::Vector, _) => {
                     return Err(general_err!(
                         "{:?} cannot be applied to a primitive type for field '{}'",
                         logical_type,
@@ -498,6 +518,14 @@ impl<'a> PrimitiveTypeBuilder<'a> {
             }
         }
 
+        // EXPERIMENTAL: the canonical VECTOR encoding carries VECTOR repetition
+        // and vector_length on a middle group, not on the primitive leaf.
+        if self.repetition == Repetition::VECTOR {
+            return Err(general_err!(
+                "VECTOR repetition is only valid on group fields, not primitive field '{}'",
+                self.name
+            ));
+        }
         Ok(Type::PrimitiveType {
             basic_info,
             physical_type: self.physical_type,
@@ -595,6 +623,7 @@ pub struct GroupTypeBuilder<'a> {
     logical_type: Option<LogicalType>,
     fields: Vec<TypePtr>,
     id: Option<i32>,
+    vector_length: Option<i32>,
 }
 
 impl<'a> GroupTypeBuilder<'a> {
@@ -607,6 +636,7 @@ impl<'a> GroupTypeBuilder<'a> {
             logical_type: None,
             fields: Vec::new(),
             id: None,
+            vector_length: None,
         }
     }
 
@@ -643,8 +673,45 @@ impl<'a> GroupTypeBuilder<'a> {
         Self { id, ..self }
     }
 
+    /// EXPERIMENTAL: sets the fixed vector length for a `Repetition::VECTOR`
+    /// group and returns itself. Must be `Some(n)` with `n > 0` when the
+    /// repetition is `VECTOR`, and `None` otherwise.
+    pub fn with_vector_length(self, vector_length: Option<i32>) -> Self {
+        Self {
+            vector_length,
+            ..self
+        }
+    }
+
     /// Creates a new `GroupType` instance from the gathered attributes.
     pub fn build(self) -> Result<Type> {
+        match self.repetition {
+            Some(Repetition::VECTOR) => validate_vector_group(
+                self.name,
+                self.vector_length,
+                self.converted_type,
+                self.logical_type.as_ref(),
+                &self.fields,
+            )?,
+            _ => {
+                if self.vector_length.is_some() {
+                    return Err(general_err!(
+                        "vector_length can only be set on a VECTOR repetition group '{}'",
+                        self.name
+                    ));
+                }
+            }
+        }
+
+        if matches!(self.logical_type, Some(LogicalType::Vector)) {
+            validate_vector_logical_group(
+                self.name,
+                self.repetition,
+                self.converted_type,
+                &self.fields,
+            )?;
+        }
+
         let mut basic_info = BasicTypeInfo {
             name: String::from(self.name),
             repetition: self.repetition,
@@ -659,8 +726,116 @@ impl<'a> GroupTypeBuilder<'a> {
         Ok(Type::GroupType {
             basic_info,
             fields: self.fields,
+            vector_length: self.vector_length,
         })
     }
+}
+
+fn validate_vector_group(
+    name: &str,
+    vector_length: Option<i32>,
+    converted_type: ConvertedType,
+    logical_type: Option<&LogicalType>,
+    fields: &[TypePtr],
+) -> Result<()> {
+    match vector_length {
+        Some(n) if n > 0 => {}
+        _ => {
+            return Err(general_err!(
+                "VECTOR repetition requires a positive vector_length for group '{}'",
+                name
+            ));
+        }
+    }
+
+    if converted_type != ConvertedType::NONE || logical_type.is_some() {
+        return Err(general_err!(
+            "VECTOR repetition group '{}' must not have a logical or converted type",
+            name
+        ));
+    }
+
+    if fields.len() != 1 || fields[0].name() != "element" {
+        return Err(general_err!(
+            "VECTOR repetition group '{}' must have exactly one child named 'element'",
+            name
+        ));
+    }
+
+    validate_vector_element_subtree(fields[0].as_ref())
+}
+
+fn validate_vector_element_subtree(element: &Type) -> Result<()> {
+    if !element.is_primitive() {
+        return Err(general_err!(
+            "VECTOR element '{}' must be a primitive field",
+            element.name()
+        ));
+    }
+    if !element.get_basic_info().has_repetition() {
+        return Err(general_err!("VECTOR element must have a repetition"));
+    }
+    if element.get_basic_info().repetition() != Repetition::REQUIRED {
+        return Err(general_err!(
+            "VECTOR element '{}' must be required, not {}",
+            element.name(),
+            element.get_basic_info().repetition()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vector_logical_group(
+    name: &str,
+    repetition: Option<Repetition>,
+    converted_type: ConvertedType,
+    fields: &[TypePtr],
+) -> Result<()> {
+    match repetition {
+        Some(Repetition::REQUIRED | Repetition::OPTIONAL) => {}
+        Some(other) => {
+            return Err(general_err!(
+                "VECTOR logical type group '{}' must be required or optional, not {}",
+                name,
+                other
+            ));
+        }
+        None => {
+            return Err(general_err!(
+                "VECTOR logical type cannot annotate root group '{}'",
+                name
+            ));
+        }
+    }
+
+    if converted_type != ConvertedType::NONE {
+        return Err(general_err!(
+            "VECTOR logical type group '{}' must not have a converted type",
+            name
+        ));
+    }
+
+    if fields.len() != 1 || fields[0].name() != "list" {
+        return Err(general_err!(
+            "VECTOR logical type group '{}' must have exactly one child named 'list'",
+            name
+        ));
+    }
+
+    let list = fields[0].as_ref();
+    if !list.is_group() || list.get_basic_info().repetition() != Repetition::VECTOR {
+        return Err(general_err!(
+            "VECTOR logical type group '{}' must contain a VECTOR-repeated group named 'list'",
+            name
+        ));
+    }
+    if list.vector_length().is_none() {
+        return Err(general_err!(
+            "VECTOR logical type group '{}' has a list child without vector_length",
+            name
+        ));
+    }
+    Ok(())
 }
 
 /// Basic type info. This contains information such as the name of the type,
@@ -857,6 +1032,9 @@ pub struct ColumnDescriptor {
 
     /// The path of this column. For instance, "a.b.c.d".
     path: ColumnPath,
+
+    /// The fixed vector length if this leaf is inside a VECTOR-repeated group.
+    vector_length: Option<i32>,
 }
 
 impl HeapSize for ColumnDescriptor {
@@ -885,12 +1063,31 @@ impl ColumnDescriptor {
         path: ColumnPath,
         repeated_ancestor_def_level: i16,
     ) -> Self {
+        Self::new_with_repeated_ancestor_and_vector(
+            primitive_type,
+            max_def_level,
+            max_rep_level,
+            path,
+            repeated_ancestor_def_level,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_repeated_ancestor_and_vector(
+        primitive_type: TypePtr,
+        max_def_level: i16,
+        max_rep_level: i16,
+        path: ColumnPath,
+        repeated_ancestor_def_level: i16,
+        vector_length: Option<i32>,
+    ) -> Self {
         Self {
             primitive_type,
             max_def_level,
             max_rep_level,
             repeated_ancestor_def_level,
             path,
+            vector_length,
         }
     }
 
@@ -974,6 +1171,12 @@ impl ColumnDescriptor {
             Type::PrimitiveType { type_length, .. } => *type_length,
             _ => panic!("Expected primitive type!"),
         }
+    }
+
+    /// EXPERIMENTAL: returns the fixed vector length when this column is inside
+    /// the canonical 3-level `VECTOR` encoding, or `None` for ordinary columns.
+    pub fn vector_length(&self) -> Option<i32> {
+        self.vector_length
     }
 
     /// Returns type precision for this column.
@@ -1097,6 +1300,7 @@ impl SchemaDescriptor {
                 &mut leaves,
                 &mut leaf_to_base,
                 &mut path,
+                None,
             );
         }
 
@@ -1229,6 +1433,7 @@ fn build_tree<'a>(
     leaves: &mut Vec<ColumnDescPtr>,
     leaf_to_base: &mut Vec<usize>,
     path_so_far: &mut Vec<&'a str>,
+    mut vector_length: Option<i32>,
 ) {
     assert!(tp.get_basic_info().has_repetition());
 
@@ -1242,19 +1447,23 @@ fn build_tree<'a>(
             max_rep_level += 1;
             repeated_ancestor_def_level = max_def_level;
         }
-        _ => {}
+        Repetition::VECTOR => {
+            vector_length = tp.vector_length();
+        }
+        Repetition::REQUIRED => {}
     }
 
     match tp.as_ref() {
         Type::PrimitiveType { .. } => {
             let mut path: Vec<String> = vec![];
             path.extend(path_so_far.iter().copied().map(String::from));
-            let desc = ColumnDescriptor::new_with_repeated_ancestor(
+            let desc = ColumnDescriptor::new_with_repeated_ancestor_and_vector(
                 tp.clone(),
                 max_def_level,
                 max_rep_level,
                 ColumnPath::new(path),
                 repeated_ancestor_def_level,
+                vector_length,
             );
             leaves.push(Arc::new(desc));
             leaf_to_base.push(root_idx);
@@ -1270,6 +1479,7 @@ fn build_tree<'a>(
                     leaves,
                     leaf_to_base,
                     path_so_far,
+                    vector_length,
                 );
                 path_so_far.pop();
             }
@@ -1340,7 +1550,7 @@ fn schema_from_array_helper<'a>(
     // Check for empty schema
     if let (true, None | Some(0)) = (is_root_node, element.num_children) {
         let builder = Type::group_type_builder(element.name);
-        return Ok((index + 1, Arc::new(builder.build().unwrap())));
+        return Ok((index + 1, Arc::new(builder.build()?)));
     }
 
     let converted_type = element.converted_type.unwrap_or(ConvertedType::NONE);
@@ -1366,6 +1576,12 @@ fn schema_from_array_helper<'a>(
             }
             let repetition = element.repetition_type.unwrap();
             if let Some(physical_type) = element.r#type {
+                if element.vector_length.is_some() {
+                    return Err(general_err!(
+                        "vector_length can only be set on a VECTOR repetition group '{}'",
+                        element.name
+                    ));
+                }
                 let length = element.type_length.unwrap_or(-1);
                 let scale = element.scale.unwrap_or(-1);
                 let precision = element.precision.unwrap_or(-1);
@@ -1383,7 +1599,8 @@ fn schema_from_array_helper<'a>(
                 let mut builder = Type::group_type_builder(element.name)
                     .with_converted_type(converted_type)
                     .with_logical_type(logical_type)
-                    .with_id(field_id);
+                    .with_id(field_id)
+                    .with_vector_length(element.vector_length);
                 if !is_root_node {
                     // Sometimes parquet-cpp and parquet-mr set repetition level REQUIRED or
                     // REPEATED for root node.
@@ -1394,7 +1611,7 @@ fn schema_from_array_helper<'a>(
                     //   All other types must have one.
                     builder = builder.with_repetition(repetition);
                 }
-                Ok((index + 1, Arc::new(builder.build().unwrap())))
+                Ok((index + 1, Arc::new(builder.build()?)))
             }
         }
         Some(n) => {
@@ -1412,7 +1629,8 @@ fn schema_from_array_helper<'a>(
                 .with_converted_type(converted_type)
                 .with_logical_type(logical_type)
                 .with_fields(fields)
-                .with_id(field_id);
+                .with_id(field_id)
+                .with_vector_length(element.vector_length);
 
             // Sometimes parquet-cpp and parquet-mr set repetition level REQUIRED or
             // REPEATED for root node.
@@ -1771,6 +1989,152 @@ mod tests {
             .with_logical_type(Some(LogicalType::_Unknown { field_id: 100 }))
             .build();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_vector_repetition_validation() {
+        let element = Arc::new(
+            Type::primitive_type_builder("element", PhysicalType::FLOAT)
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+
+        // Valid: VECTOR-repeated middle group with a positive vector_length.
+        let list = Type::group_type_builder("list")
+            .with_repetition(Repetition::VECTOR)
+            .with_vector_length(Some(3))
+            .with_fields(vec![element.clone()])
+            .build()
+            .unwrap();
+        assert_eq!(list.vector_length(), Some(3));
+        assert!(!list.is_optional());
+
+        // VECTOR requires a positive vector_length.
+        assert!(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::VECTOR)
+                .with_fields(vec![element.clone()])
+                .build()
+                .unwrap_err()
+                .to_string()
+                .contains("positive vector_length")
+        );
+
+        // VECTOR is rejected on primitive leaf fields.
+        assert!(
+            Type::primitive_type_builder("element", PhysicalType::FLOAT)
+                .with_repetition(Repetition::VECTOR)
+                .build()
+                .unwrap_err()
+                .to_string()
+                .contains("only valid on group")
+        );
+
+        // VECTOR element must be a required primitive leaf.
+        let optional_element = Arc::new(
+            Type::primitive_type_builder("element", PhysicalType::FLOAT)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .unwrap(),
+        );
+        assert!(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::VECTOR)
+                .with_vector_length(Some(3))
+                .with_fields(vec![optional_element])
+                .build()
+                .unwrap_err()
+                .to_string()
+                .contains("must be required")
+        );
+        let group_element = Arc::new(
+            Type::group_type_builder("element")
+                .with_repetition(Repetition::REQUIRED)
+                .with_fields(vec![element.clone()])
+                .build()
+                .unwrap(),
+        );
+        assert!(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::VECTOR)
+                .with_vector_length(Some(3))
+                .with_fields(vec![group_element])
+                .build()
+                .unwrap_err()
+                .to_string()
+                .contains("primitive field")
+        );
+
+        // vector_length is invalid without VECTOR repetition.
+        assert!(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::REQUIRED)
+                .with_vector_length(Some(3))
+                .with_fields(vec![element.clone()])
+                .build()
+                .unwrap_err()
+                .to_string()
+                .contains("can only be set on a VECTOR")
+        );
+
+        // The outer VECTOR logical group must contain the VECTOR list group.
+        let vector = Type::group_type_builder("v")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Vector))
+            .with_fields(vec![Arc::new(list)])
+            .build()
+            .unwrap();
+        assert_eq!(
+            vector.get_basic_info().logical_type_ref(),
+            Some(&LogicalType::Vector)
+        );
+
+        // The canonical VECTOR logical type and group-level vector_length survive
+        // a Thrift schema round-trip.
+        let root = Type::group_type_builder("schema")
+            .with_fields(vec![Arc::new(vector.clone())])
+            .build()
+            .unwrap();
+        let roundtripped = roundtrip_schema(Arc::new(root)).unwrap();
+        assert_eq!(roundtripped.get_fields()[0].as_ref(), &vector);
+    }
+
+    #[test]
+    fn test_parquet_schema_from_array_rejects_zero_child_vector_group() {
+        let elements = vec![
+            SchemaElement {
+                r#type: None,
+                type_length: None,
+                repetition_type: None,
+                name: "schema",
+                num_children: Some(1),
+                converted_type: None,
+                scale: None,
+                precision: None,
+                field_id: None,
+                logical_type: None,
+                vector_length: None,
+            },
+            SchemaElement {
+                r#type: None,
+                type_length: None,
+                repetition_type: Some(Repetition::VECTOR),
+                name: "list",
+                num_children: Some(0),
+                converted_type: None,
+                scale: None,
+                precision: None,
+                field_id: None,
+                logical_type: None,
+                vector_length: Some(3),
+            },
+        ];
+        let err = parquet_schema_from_array(elements).unwrap_err().to_string();
+        assert!(
+            err.contains("one child named 'element'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2518,6 +2882,7 @@ mod tests {
             precision: None,
             field_id: None,
             logical_type: None,
+            vector_length: None,
         }];
         let result = parquet_schema_from_array(elements);
         assert!(result.unwrap_err().to_string().contains("Integer overflow"));

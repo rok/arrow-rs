@@ -115,6 +115,16 @@ impl TreeBuilder {
         assert!(field.get_basic_info().has_repetition());
         // Update current definition and repetition levels for this type
         let repetition = field.get_basic_info().repetition();
+        // EXPERIMENTAL: the row-based record API has no fixed-size-list concept and
+        // would read a VECTOR column as one element per row, silently corrupting
+        // output. Reject VECTOR columns explicitly; use the Arrow reader instead.
+        if repetition == Repetition::VECTOR {
+            return Err(general_err!(
+                "Reading VECTOR columns is not supported by the record (row) API; \
+                 use the Arrow reader instead (column '{}')",
+                field.name()
+            ));
+        }
         match repetition {
             Repetition::OPTIONAL => {
                 curr_def_level += 1;

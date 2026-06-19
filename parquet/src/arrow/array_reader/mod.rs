@@ -38,6 +38,7 @@ mod cached_array_reader;
 mod empty_array;
 mod fixed_len_byte_array;
 mod fixed_size_list_array;
+mod fixed_size_list_vector_array;
 mod list_array;
 mod list_view_array;
 mod map_array;
@@ -61,6 +62,7 @@ pub use byte_view_array::make_byte_view_array_reader;
 #[allow(unused_imports)] // Only used for benchmarks
 pub use fixed_len_byte_array::make_fixed_len_byte_array_reader;
 pub use fixed_size_list_array::FixedSizeListArrayReader;
+pub use fixed_size_list_vector_array::FixedSizeListVectorArrayReader;
 pub use list_array::ListArrayReader;
 pub use list_view_array::ListViewArrayReader;
 pub use map_array::MapArrayReader;

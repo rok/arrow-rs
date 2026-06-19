@@ -190,20 +190,24 @@ impl<P: Iterator<Item = Page> + Send> PageReader for InMemoryPageReader<P> {
                 Page::DataPage { num_values, .. } => Ok(Some(PageMetadata {
                     num_rows: None,
                     num_levels: Some(*num_values as _),
+                    num_nulls: None,
                     is_dict: false,
                 })),
                 Page::DataPageV2 {
                     num_rows,
                     num_values,
+                    num_nulls,
                     ..
                 } => Ok(Some(PageMetadata {
                     num_rows: Some(*num_rows as _),
                     num_levels: Some(*num_values as _),
+                    num_nulls: Some(*num_nulls as _),
                     is_dict: false,
                 })),
                 Page::DictionaryPage { .. } => Ok(Some(PageMetadata {
                     num_rows: None,
                     num_levels: None,
+                    num_nulls: None,
                     is_dict: true,
                 })),
             }
