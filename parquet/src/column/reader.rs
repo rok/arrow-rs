@@ -301,12 +301,21 @@ where
 
                 // If page has less rows than the remaining records to
                 // be skipped, skip entire page
-                let rows = metadata.num_rows.or_else(|| {
-                    // If no repetition levels, num_levels == num_rows
-                    self.rep_level_decoder
-                        .is_none()
-                        .then_some(metadata.num_levels)?
-                });
+                let rows = if self.descr.vector_length().is_some() {
+                    // EXPERIMENTAL: a VECTOR column is decoded as a flat element
+                    // stream (1 value == 1 record here), so skip whole pages by the
+                    // flat element count (num_levels). The DataPageV2 header's
+                    // num_rows is the *logical* vector-row count and must not be used
+                    // for this flat skip — doing so would miscount by vector_length.
+                    metadata.num_levels
+                } else {
+                    metadata.num_rows.or_else(|| {
+                        // If no repetition levels, num_levels == num_rows
+                        self.rep_level_decoder
+                            .is_none()
+                            .then_some(metadata.num_levels)?
+                    })
+                };
 
                 if let Some(rows) = rows {
                     if rows <= remaining_records {

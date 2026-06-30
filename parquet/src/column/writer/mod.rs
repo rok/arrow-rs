@@ -479,6 +479,9 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         let compressor = create_codec(codec, &codec_options).unwrap();
         let encoder = E::try_new(&descr, props.as_ref()).unwrap();
 
+        // VECTOR columns keep the standard Parquet statistics semantics: page and
+        // column statistics describe the primitive element values, not whole vector
+        // rows.
         let statistics_enabled = props.statistics_enabled(descr.path());
 
         let mut encodings = BTreeSet::new();
@@ -569,6 +572,21 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             value_indices.map_or(values.len(), |i| i.len())
         };
 
+        // EXPERIMENTAL: a VECTOR column is written as whole vectors (each record is
+        // `vector_length` contiguous values with no levels). Reject a batch that
+        // is not a whole number of vectors, so page boundaries stay vector-aligned
+        // and the row count (`num_levels / vector_length`) is exact.
+        if let Some(n) = self.descr.vector_length() {
+            let n = n as usize;
+            if num_levels % n != 0 {
+                return Err(general_err!(
+                    "VECTOR column write must contain whole vectors: {} values is not a multiple of vector_length {}",
+                    num_levels,
+                    n
+                ));
+            }
+        }
+
         if let Some(min) = min {
             update_min(&self.descr, min, &mut self.column_metrics.min_column_value);
         }
@@ -597,6 +615,11 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         } else {
             self.props.write_batch_size()
         };
+        // EXPERIMENTAL: for a VECTOR column, keep every data page on a whole-vector
+        // boundary. Each record is `vector_length` contiguous values with no
+        // levels, so mini-batch (and therefore page) boundaries must fall on a
+        // multiple of `vector_length`.
+        let vector_length = self.descr.vector_length().map(|n| n as usize);
         let chunker = ByteBudgetChunker::new(&self.descr, &self.props, base_batch_size);
         while levels_offset < num_levels {
             let mut end_offset = num_levels.min(levels_offset + base_batch_size);
@@ -605,6 +628,14 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             if let LevelDataRef::Materialized(levels) = rep_levels {
                 while end_offset < levels.len() && levels[end_offset] != 0 {
                     end_offset += 1;
+                }
+            }
+
+            // Align the mini-batch boundary to a whole vector, guaranteeing at
+            // least one full vector of forward progress.
+            if let Some(n) = vector_length {
+                if end_offset < num_levels {
+                    end_offset = (end_offset - end_offset % n).max(levels_offset + n);
                 }
             }
 
@@ -626,6 +657,16 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 values_offset,
                 chunk_size,
             );
+
+            // For a VECTOR column, skip byte-budget sub-batching so the page only
+            // ever flushes on the vector-aligned mini-batch boundary above. The
+            // whole mini-batch is at most `base_batch_size` (or one vector)
+            // values, and `should_add_data_page` still bounds the page by size.
+            let sub_batch_size = if vector_length.is_some() {
+                chunk_size
+            } else {
+                sub_batch_size
+            };
 
             if sub_batch_size >= chunk_size {
                 values_offset += self.write_mini_batch(
@@ -798,10 +839,14 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         let offset_index = self.offset_index_builder.map(|b| b.build());
 
+        // Bloom filters, like statistics, are over primitive element values for
+        // VECTOR columns.
+        let bloom_filter = self.encoder.flush_bloom_filter();
+
         Ok(ColumnCloseResult {
             bytes_written: self.column_metrics.total_bytes_written,
             rows_written: self.column_metrics.total_rows_written,
-            bloom_filter: self.encoder.flush_bloom_filter(),
+            bloom_filter,
             metadata,
             column_index,
             offset_index,
@@ -987,6 +1032,12 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 }
             }
             self.page_metrics.num_buffered_rows += new_rows;
+        } else if let Some(n) = self.descr.vector_length() {
+            // EXPERIMENTAL: a VECTOR column stores exactly `vector_length` values
+            // per row with no levels, so each record spans `n` contiguous values.
+            // Mini-batch boundaries are aligned to multiples of `n` (see
+            // `write_batch_internal`), so this division is exact.
+            self.page_metrics.num_buffered_rows += (num_levels / n as usize) as u32;
         } else {
             // Each value is exactly one row.
             // Equals to the number of values, we count nulls as well.
@@ -1954,6 +2005,41 @@ mod tests {
                 "Parquet error: Expected to write 4 values, but have only 2"
             );
         }
+    }
+
+    #[test]
+    fn test_column_writer_vector_requires_whole_vectors() {
+        use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};
+
+        let page_writer = get_test_page_writer();
+        let props = Default::default();
+        // VECTOR FLOAT element leaf with vector_length 3 carried by its parent
+        // VECTOR-repeated group.
+        let tpe = SchemaType::primitive_type_builder("element", crate::basic::Type::FLOAT)
+            .with_repetition(crate::basic::Repetition::REQUIRED)
+            .build()
+            .unwrap();
+        let descr = Arc::new(ColumnDescriptor::new_with_repeated_ancestor_and_vector(
+            Arc::new(tpe),
+            0,
+            0,
+            ColumnPath::new(vec![
+                "v".to_string(),
+                "list".to_string(),
+                "element".to_string(),
+            ]),
+            0,
+            Some(3),
+        ));
+        let column_writer = get_column_writer(descr, props, page_writer);
+        let mut writer = get_typed_column_writer::<FloatType>(column_writer);
+
+        // 4 values is not a whole number of 3-element vectors.
+        let err = writer
+            .write_batch(&[1.0, 2.0, 3.0, 4.0], None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whole vectors"), "unexpected error: {err}");
     }
 
     #[test]

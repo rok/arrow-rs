@@ -295,6 +295,8 @@ union LogicalType {
    17: (GeometryType) Geometry
    /// A geospatial feature in the WKB format with an explicit (non-linear/non-planar) edges interpolation.
    18: (GeographyType) Geography
+   /// A fixed-size vector (fixed-size list) annotation.
+   19: Vector
 }
 );
 
@@ -359,6 +361,12 @@ enum FieldRepetitionType {
   OPTIONAL = 1;
   /// The field is repeated and can contain 0 or more values.
   REPEATED = 2;
+  /// EXPERIMENTAL: the field repeats exactly `vector_length` times per parent
+  /// value and, unlike `REPEATED`, does NOT increase the maximum definition or
+  /// repetition level of its descendants. Only valid on the middle group of the
+  /// canonical 3-level `VECTOR` logical type encoding; see
+  /// [`crate::schema::types::SchemaDescriptor`].
+  VECTOR = 3;
 }
 );
 
@@ -1043,7 +1051,7 @@ impl ColumnOrder {
                     true => SortOrder::SIGNED,
                     false => SortOrder::UNSIGNED,
                 },
-                LogicalType::Map | LogicalType::List => SortOrder::UNDEFINED,
+                LogicalType::Map | LogicalType::List | LogicalType::Vector => SortOrder::UNDEFINED,
                 LogicalType::Decimal(_) => SortOrder::SIGNED,
                 LogicalType::Date => SortOrder::SIGNED,
                 LogicalType::Time(_) => SortOrder::SIGNED,
@@ -1242,6 +1250,7 @@ impl From<Option<LogicalType>> for ConvertedType {
                 | LogicalType::Variant(_)
                 | LogicalType::Geometry(_)
                 | LogicalType::Geography(_)
+                | LogicalType::Vector
                 | LogicalType::_Unknown { .. }
                 | LogicalType::Unknown => ConvertedType::NONE,
             },
@@ -1261,6 +1270,7 @@ impl str::FromStr for Repetition {
             "REQUIRED" => Ok(Repetition::REQUIRED),
             "OPTIONAL" => Ok(Repetition::OPTIONAL),
             "REPEATED" => Ok(Repetition::REPEATED),
+            "VECTOR" => Ok(Repetition::VECTOR),
             other => Err(general_err!("Invalid parquet repetition {}", other)),
         }
     }
@@ -1326,6 +1336,7 @@ impl str::FromStr for LogicalType {
             "INTEGER" => Ok(LogicalType::integer(8, false)),
             "MAP" => Ok(LogicalType::Map),
             "LIST" => Ok(LogicalType::List),
+            "VECTOR" => Ok(LogicalType::Vector),
             "ENUM" => Ok(LogicalType::Enum),
             "DECIMAL" => Ok(LogicalType::decimal(-1, -1)),
             "DATE" => Ok(LogicalType::Date),
@@ -1745,6 +1756,10 @@ mod tests {
             ConvertedType::MAP
         );
         assert_eq!(
+            ConvertedType::from(Some(LogicalType::Vector)),
+            ConvertedType::NONE
+        );
+        assert_eq!(
             ConvertedType::from(Some(LogicalType::Uuid)),
             ConvertedType::NONE
         );
@@ -1779,6 +1794,7 @@ mod tests {
         test_roundtrip(LogicalType::String);
         test_roundtrip(LogicalType::Map);
         test_roundtrip(LogicalType::List);
+        test_roundtrip(LogicalType::Vector);
         test_roundtrip(LogicalType::Enum);
         test_roundtrip(LogicalType::decimal(0, 20));
         test_roundtrip(LogicalType::Date);

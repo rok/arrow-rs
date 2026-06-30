@@ -1071,6 +1071,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     Ok(Some(PageMetadata {
                         num_rows: None,
                         num_levels: None,
+                        num_nulls: None,
                         is_dict: true,
                     }))
                 } else if let Some(page) = page_locations.front() {
@@ -1082,6 +1083,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     Ok(Some(PageMetadata {
                         num_rows: Some(next_rows - page.first_row_index as usize),
                         num_levels: None,
+                        num_nulls: None,
                         is_dict: false,
                     }))
                 } else {

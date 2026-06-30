@@ -22,7 +22,7 @@ use crate::arrow::schema::extension::try_add_extension_type;
 use crate::arrow::schema::primitive::convert_primitive;
 use crate::arrow::schema::virtual_type::{RowGroupIndex, RowNumber};
 use crate::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
-use crate::basic::{ConvertedType, Repetition};
+use crate::basic::{ConvertedType, LogicalType, Repetition};
 use crate::errors::ParquetError;
 use crate::errors::Result;
 use crate::schema::types::{SchemaDescriptor, Type, TypePtr};
@@ -149,6 +149,9 @@ pub enum ParquetFieldType {
         col_idx: usize,
         /// The type of the column in parquet
         primitive_type: TypePtr,
+        /// Fixed vector length if this primitive is the leaf under a canonical
+        /// VECTOR-repeated group.
+        vector_length: Option<i32>,
     },
     Group {
         children: Vec<ParquetField>,
@@ -175,6 +178,14 @@ struct VisitorContext {
     ///
     /// [1]: https://github.com/apache/parquet-format/blob/38818fa0e7efd54b535001a4448030a40619c2a3/LogicalTypes.md?plain=1#L718-L806
     treat_repeated_as_list_arrow_hint: bool,
+
+    /// Fixed vector length if the current subtree is under a canonical
+    /// VECTOR-repeated middle group.
+    vector_length: Option<i32>,
+
+    /// Depth of the current Parquet type from the schema root. The root message
+    /// itself is depth 0; top-level fields are depth 1.
+    depth: usize,
 }
 
 impl VisitorContext {
@@ -185,6 +196,10 @@ impl VisitorContext {
             Repetition::OPTIONAL => (self.def_level + 1, self.rep_level, true),
             Repetition::REQUIRED => (self.def_level, self.rep_level, false),
             Repetition::REPEATED => (self.def_level + 1, self.rep_level + 1, false),
+            // A VECTOR-repeated middle group does not raise the definition or
+            // repetition level of its descendants. Its fixed multiplicity is
+            // carried by SchemaElement::vector_length.
+            Repetition::VECTOR => (self.def_level, self.rep_level, false),
         }
     }
 }
@@ -216,6 +231,12 @@ impl Visitor {
         }
 
         let repetition = get_repetition(primitive_type);
+        if repetition == Repetition::VECTOR {
+            return Err(arrow_err!(
+                "VECTOR repetition is only valid on group fields, not primitive field '{}'",
+                primitive_type.name()
+            ));
+        }
         let (def_level, rep_level, nullable) = context.levels(repetition);
 
         let primitive_arrow_data_type = match repetition {
@@ -240,6 +261,13 @@ impl Visitor {
 
         let arrow_type = convert_primitive(primitive_type, primitive_arrow_data_type)?;
 
+        if context.vector_length.is_some() && arrow_type == DataType::Null {
+            return Err(arrow_err!(
+                "VECTOR element '{}' has an unsupported null/unknown element type",
+                primitive_type.name()
+            ));
+        }
+
         let primitive_field = ParquetField {
             rep_level,
             def_level,
@@ -248,6 +276,7 @@ impl Visitor {
             field_type: ParquetFieldType::Primitive {
                 primitive_type: primitive_type.clone(),
                 col_idx,
+                vector_length: context.vector_length,
             },
         };
 
@@ -345,6 +374,8 @@ impl Visitor {
                 // not its children. A repeated child's arrow hint will be List<...>
                 // and needs to be unwrapped accordingly.
                 treat_repeated_as_list_arrow_hint: true,
+                vector_length: None,
+                depth: context.depth + 1,
             };
 
             if let Some(child) = self.dispatch(parquet_field, child_ctx)? {
@@ -376,6 +407,108 @@ impl Visitor {
         }))
     }
 
+    fn visit_vector(
+        &mut self,
+        vector_type: &TypePtr,
+        context: VisitorContext,
+    ) -> Result<Option<ParquetField>> {
+        if vector_type.is_primitive() {
+            return Err(arrow_err!(
+                "{:?} is a VECTOR type and must be a group.",
+                vector_type
+            ));
+        }
+
+        let repetition = get_repetition(vector_type);
+        let (def_level, rep_level, nullable) = match repetition {
+            Repetition::REQUIRED | Repetition::OPTIONAL => context.levels(repetition),
+            Repetition::REPEATED => return Err(arrow_err!("VECTOR type cannot be repeated")),
+            Repetition::VECTOR => {
+                return Err(arrow_err!(
+                    "VECTOR logical type cannot use VECTOR repetition"
+                ));
+            }
+        };
+
+        let fields = vector_type.get_fields();
+        if fields.len() != 1 || fields[0].name() != "list" {
+            return Err(arrow_err!(
+                "VECTOR logical type must have a single child named 'list', found {} child(ren)",
+                fields.len()
+            ));
+        }
+
+        let list = &fields[0];
+        if !list.is_group() || get_repetition(list) != Repetition::VECTOR {
+            return Err(arrow_err!(
+                "VECTOR logical type child 'list' must be a VECTOR-repeated group"
+            ));
+        }
+        let vector_length = list
+            .vector_length()
+            .ok_or_else(|| arrow_err!("VECTOR-repeated group 'list' is missing vector_length"))?;
+
+        let items = list.get_fields();
+        if items.len() != 1 || items[0].name() != "element" {
+            return Err(arrow_err!(
+                "VECTOR-repeated group 'list' must have a single child named 'element', found {} child(ren)",
+                items.len()
+            ));
+        }
+        let element_type = &items[0];
+        if !element_type.is_primitive() {
+            return Err(arrow_err!(
+                "reading VECTOR columns with non-primitive elements is not supported"
+            ));
+        }
+        if get_repetition(element_type) != Repetition::REQUIRED {
+            return Err(arrow_err!(
+                "VECTOR element '{}' must be required, not {}",
+                element_type.name(),
+                get_repetition(element_type)
+            ));
+        }
+
+        let arrow_child_hint = match &context.data_type {
+            Some(DataType::FixedSizeList(child, _)) => Some(child.as_ref()),
+            Some(d) => {
+                return Err(arrow_err!(
+                    "incompatible arrow schema, expected fixed-size list got {}",
+                    d
+                ));
+            }
+            None => None,
+        };
+
+        let child_context = VisitorContext {
+            rep_level,
+            def_level,
+            data_type: arrow_child_hint.map(|f| f.data_type().clone()),
+            treat_repeated_as_list_arrow_hint: true,
+            vector_length: Some(vector_length),
+            depth: context.depth + 2,
+        };
+
+        match self.dispatch(element_type, child_context) {
+            Ok(Some(item)) => {
+                let mut item_field = convert_field(element_type, &item, arrow_child_hint, true)?;
+                if let Some(hint) = arrow_child_hint {
+                    item_field = item_field.with_name(hint.name());
+                }
+                Ok(Some(ParquetField {
+                    rep_level,
+                    def_level,
+                    nullable,
+                    arrow_type: DataType::FixedSizeList(Arc::new(item_field), vector_length),
+                    field_type: ParquetFieldType::Group {
+                        children: vec![item],
+                    },
+                }))
+            }
+            r => r,
+        }
+    }
+
     fn visit_map(
         &mut self,
         map_type: &TypePtr,
@@ -386,6 +519,7 @@ impl Visitor {
             Repetition::REQUIRED => (context.def_level + 1, false),
             Repetition::OPTIONAL => (context.def_level + 2, true),
             Repetition::REPEATED => return Err(arrow_err!("Map cannot be repeated")),
+            Repetition::VECTOR => return Err(arrow_err!("Map cannot use VECTOR repetition")),
         };
 
         if map_type.get_fields().len() != 1 {
@@ -421,6 +555,9 @@ impl Visitor {
         match map_key.get_basic_info().repetition() {
             Repetition::REPEATED => {
                 return Err(arrow_err!("Map keys cannot be repeated"));
+            }
+            Repetition::VECTOR => {
+                return Err(arrow_err!("Map keys cannot use VECTOR repetition"));
             }
             Repetition::REQUIRED | Repetition::OPTIONAL => {
                 // Relaxed check for having repetition REQUIRED as there exists
@@ -467,6 +604,8 @@ impl Visitor {
                 data_type: arrow_key.map(|x| x.data_type().clone()),
                 // Key is not repeated
                 treat_repeated_as_list_arrow_hint: false,
+                vector_length: None,
+                depth: context.depth + 2,
             };
 
             self.dispatch(map_key, context)?
@@ -479,6 +618,8 @@ impl Visitor {
                 data_type: arrow_value.map(|x| x.data_type().clone()),
                 // Value type can be repeated
                 treat_repeated_as_list_arrow_hint: true,
+                vector_length: None,
+                depth: context.depth + 2,
             };
 
             self.dispatch(map_value, context)?
@@ -549,6 +690,7 @@ impl Visitor {
             Repetition::REQUIRED => (context.def_level, false),
             Repetition::OPTIONAL => (context.def_level + 1, true),
             Repetition::REPEATED => return Err(arrow_err!("List type cannot be repeated")),
+            Repetition::VECTOR => return Err(arrow_err!("List type cannot use VECTOR repetition")),
         };
 
         let arrow_field = match &context.data_type {
@@ -578,6 +720,8 @@ impl Visitor {
                 def_level,
                 data_type: arrow_field.map(|f| f.data_type().clone()),
                 treat_repeated_as_list_arrow_hint: false,
+                vector_length: None,
+                depth: context.depth + 1,
             };
 
             return match self.visit_primitive(repeated_field, context) {
@@ -610,6 +754,8 @@ impl Visitor {
                 def_level,
                 data_type: arrow_field.map(|f| f.data_type().clone()),
                 treat_repeated_as_list_arrow_hint: false,
+                vector_length: None,
+                depth: context.depth + 1,
             };
 
             return match self.visit_struct(repeated_field, context) {
@@ -631,6 +777,8 @@ impl Visitor {
             rep_level,
             data_type: arrow_field.map(|f| f.data_type().clone()),
             treat_repeated_as_list_arrow_hint: true,
+            vector_length: None,
+            depth: context.depth + 2,
         };
 
         match self.dispatch(item_type, new_context) {
@@ -669,6 +817,21 @@ impl Visitor {
     ) -> Result<Option<ParquetField>> {
         if cur_type.is_primitive() {
             self.visit_primitive(cur_type, context)
+        } else if cur_type.get_basic_info().logical_type_ref() == Some(&LogicalType::Vector) {
+            if context.depth != 1 {
+                return Err(arrow_err!(
+                    "VECTOR logical type group '{}' is only supported as a top-level field",
+                    cur_type.name()
+                ));
+            }
+            self.visit_vector(cur_type, context)
+        } else if cur_type.get_basic_info().has_repetition()
+            && cur_type.get_basic_info().repetition() == Repetition::VECTOR
+        {
+            Err(arrow_err!(
+                "VECTOR repetition group '{}' must be the 'list' child of a VECTOR logical type",
+                cur_type.name()
+            ))
         } else {
             match cur_type.get_basic_info().converted_type() {
                 ConvertedType::LIST => self.visit_list(cur_type, context),
@@ -771,9 +934,14 @@ fn convert_field(
                 );
                 ret.set_metadata(meta);
             }
-            try_add_extension_type(ret, parquet_type)
+            add_extension_type(ret, parquet_type)
         }
     }
+}
+
+/// Applies a Parquet logical-type extension (UUID, JSON, etc.) to `field`.
+pub(crate) fn add_extension_type(field: Field, parquet_type: &Type) -> Result<Field, ParquetError> {
+    try_add_extension_type(field, parquet_type)
 }
 
 /// Computes the [`ParquetField`] for the provided [`SchemaDescriptor`] with `leaf_columns` listing
@@ -796,6 +964,8 @@ pub fn convert_schema(
         def_level: 0,
         data_type: embedded_arrow_schema.map(|fields| DataType::Struct(fields.clone())),
         treat_repeated_as_list_arrow_hint: true,
+        vector_length: None,
+        depth: 0,
     };
 
     visitor.dispatch(&schema.root_schema_ptr(), context)
@@ -814,6 +984,8 @@ pub fn convert_type(parquet_type: &TypePtr) -> Result<ParquetField> {
         data_type: None,
         // We might be inside list
         treat_repeated_as_list_arrow_hint: false,
+        vector_length: None,
+        depth: 1,
     };
 
     Ok(visitor.dispatch(parquet_type, context)?.unwrap())
@@ -1877,5 +2049,132 @@ message schema {
                 true,
             )]),
         )
+    }
+
+    #[test]
+    fn canonical_vector_schema_converts_to_fixed_size_list() -> crate::errors::Result<()> {
+        test_expected_type(
+            "
+            message schema {
+              required group v (VECTOR) {
+                vector group list [3] {
+                  required float element;
+                }
+              }
+            }
+            ",
+            Fields::from(vec![Field::new(
+                "v",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("element", DataType::Float32, false)),
+                    3,
+                ),
+                false,
+            )]),
+        )
+    }
+
+    #[test]
+    fn standalone_vector_repetition_group_is_rejected() {
+        use crate::basic::{Repetition, Type as PhysicalType};
+        use crate::schema::types::Type;
+
+        let element = Arc::new(
+            Type::primitive_type_builder("element", PhysicalType::FLOAT)
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let list = Arc::new(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::VECTOR)
+                .with_vector_length(Some(3))
+                .with_fields(vec![element])
+                .build()
+                .unwrap(),
+        );
+        let root = Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![list])
+                .build()
+                .unwrap(),
+        );
+        let descr = SchemaDescriptor::new(root);
+
+        let err = convert_schema(&descr, ProjectionMask::all(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("VECTOR logical type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_vector_logical_group_is_rejected() {
+        let schema = Arc::new(
+            parse_message_type(
+                "
+                message schema {
+                  required group s {
+                    required group v (VECTOR) {
+                      vector group list [3] {
+                        required float element;
+                      }
+                    }
+                  }
+                }
+                ",
+            )
+            .unwrap(),
+        );
+        let descr = SchemaDescriptor::new(schema);
+
+        let err = convert_schema(&descr, ProjectionMask::all(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("top-level field"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vector_leaf_with_null_element_is_rejected() {
+        use crate::basic::{LogicalType, Repetition, Type as PhysicalType};
+        use crate::schema::types::Type;
+
+        // An Unknown/Null element type is contradictory for a dense vector.
+        let element = Arc::new(
+            Type::primitive_type_builder("element", PhysicalType::INT32)
+                .with_repetition(Repetition::REQUIRED)
+                .with_logical_type(Some(LogicalType::Unknown))
+                .build()
+                .unwrap(),
+        );
+        let list = Arc::new(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::VECTOR)
+                .with_vector_length(Some(3))
+                .with_fields(vec![element])
+                .build()
+                .unwrap(),
+        );
+        let vector = Arc::new(
+            Type::group_type_builder("v")
+                .with_repetition(Repetition::REQUIRED)
+                .with_logical_type(Some(LogicalType::Vector))
+                .with_fields(vec![list])
+                .build()
+                .unwrap(),
+        );
+        let root = Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![vector])
+                .build()
+                .unwrap(),
+        );
+        let descr = SchemaDescriptor::new(root);
+
+        let err = convert_schema(&descr, ProjectionMask::all(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("null/unknown element"),
+            "unexpected error: {err}"
+        );
     }
 }

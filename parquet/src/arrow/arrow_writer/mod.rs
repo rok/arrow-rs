@@ -36,7 +36,8 @@ use super::schema::{add_encoded_arrow_schema_to_metadata, decimal_length_from_pr
 
 use crate::arrow::ArrowSchemaConverter;
 use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
-use crate::basic::PageType;
+use crate::arrow::schema::vector_eligible_fixed_size_list;
+use crate::basic::{LogicalType, PageType};
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
 use crate::column::writer::encoder::ColumnValueEncoder;
@@ -51,8 +52,8 @@ use crate::file::metadata::{KeyValue, ParquetMetaData, RowGroupMetaData};
 use crate::file::properties::{WriterProperties, WriterPropertiesPtr};
 use crate::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
-use crate::schema::types::{ColumnDescPtr, SchemaDescPtr, SchemaDescriptor};
-use levels::{ArrayLevels, calculate_array_levels};
+use crate::schema::types::{ColumnDescPtr, SchemaDescPtr, SchemaDescriptor, Type};
+use levels::{ArrayLevels, calculate_array_levels_with_options};
 
 mod byte_array;
 mod levels;
@@ -248,7 +249,9 @@ impl<W: Write + Send> ArrowWriter<W> {
         let schema = if let Some(parquet_schema) = options.schema_descr {
             parquet_schema.clone()
         } else {
-            let mut converter = ArrowSchemaConverter::new().with_coerce_types(props.coerce_types());
+            let mut converter = ArrowSchemaConverter::new()
+                .with_coerce_types(props.coerce_types())
+                .with_vector_encoding(props.vector_encoding());
             if let Some(schema_root) = &options.schema_root {
                 converter = converter.schema_root(schema_root);
             }
@@ -943,8 +946,33 @@ pub struct ArrowLeafColumn(ArrayLevels);
 ///
 /// This function can be used along with [`get_column_writers`] to encode
 /// individual columns in parallel. See example on [`ArrowColumnWriter`]
+///
+/// Note: for a Parquet schema built with EXPERIMENTAL VECTOR encoding
+/// ([`ArrowSchemaConverter::with_vector_encoding`]), use
+/// [`compute_leaves_with_options`] with a matching `vector_encoding` flag instead,
+/// so the produced leaves line up with the VECTOR column writers.
 pub fn compute_leaves(field: &Field, array: &ArrayRef) -> Result<Vec<ArrowLeafColumn>> {
-    let levels = calculate_array_levels(array, field)?;
+    compute_leaves_with_options(field, array, false)
+}
+
+/// Like [`compute_leaves`], but with `vector_encoding` selecting whether an
+/// eligible top-level `FixedSizeList` is flattened into a Parquet `VECTOR` column
+/// (EXPERIMENTAL).
+///
+/// When using the lower-level parallel column-writer API ([`get_column_writers`]
+/// / [`ArrowRowGroupWriterFactory`]) with a schema built using
+/// [`ArrowSchemaConverter::with_vector_encoding`] /
+/// [`WriterPropertiesBuilder::set_vector_encoding`], pass the **same**
+/// `vector_encoding` value here so the produced leaves line up with the column
+/// writers; otherwise the leaf shapes will not match the Parquet schema.
+///
+/// [`WriterPropertiesBuilder::set_vector_encoding`]: crate::file::properties::WriterPropertiesBuilder::set_vector_encoding
+pub fn compute_leaves_with_options(
+    field: &Field,
+    array: &ArrayRef,
+    vector_encoding: bool,
+) -> Result<Vec<ArrowLeafColumn>> {
+    let levels = calculate_array_levels_with_options(array, field, vector_encoding)?;
     Ok(levels.into_iter().map(ArrowLeafColumn).collect())
 }
 
@@ -1212,6 +1240,40 @@ impl ArrowColumnWriter {
     }
 }
 
+fn vector_length_for_root_field(field: &Type) -> Option<i32> {
+    if field.get_basic_info().logical_type_ref() == Some(&LogicalType::Vector) {
+        field
+            .get_fields()
+            .first()
+            .and_then(|list| list.vector_length())
+    } else {
+        None
+    }
+}
+
+/// Returns whether the top-level field at `idx` is VECTOR-encoded, validating that
+/// the Arrow `FixedSizeList` matches the Parquet `vector_length`. A mismatch would
+/// silently corrupt row counts (the column writer divides values by the Parquet
+/// length while the row group counts Arrow rows), so it is rejected.
+fn vector_field_flatten(vector_lengths: &[Option<i32>], idx: usize, field: &Field) -> Result<bool> {
+    match vector_lengths.get(idx).copied().flatten() {
+        Some(expected) => match vector_eligible_fixed_size_list(field) {
+            Some((_, size)) if size == expected => Ok(true),
+            Some((_, size)) => Err(general_err!(
+                "VECTOR column '{}' has Parquet vector_length {} but Arrow FixedSizeList size {}",
+                field.name(),
+                expected,
+                size
+            )),
+            None => Err(general_err!(
+                "VECTOR column '{}' must be backed by a non-nullable FixedSizeList with a fixed-width primitive element",
+                field.name()
+            )),
+        },
+        None => Ok(false),
+    }
+}
+
 /// Encodes [`RecordBatch`] to a parquet row group
 ///
 /// Note: this structure is created by [`ArrowRowGroupWriterFactory`] internally used to
@@ -1223,22 +1285,34 @@ struct ArrowRowGroupWriter {
     writers: Vec<ArrowColumnWriter>,
     schema: SchemaRef,
     buffered_rows: usize,
+    /// Per top-level Arrow field: the Parquet `VECTOR` length, if that field is
+    /// encoded as a VECTOR column. Derived from the actual Parquet schema (not the
+    /// `vector_encoding` flag), so it stays correct even when an explicit schema
+    /// is supplied.
+    vector_lengths: Vec<Option<i32>>,
 }
 
 impl ArrowRowGroupWriter {
-    fn new(writers: Vec<ArrowColumnWriter>, arrow: &SchemaRef) -> Self {
+    fn new(
+        writers: Vec<ArrowColumnWriter>,
+        arrow: &SchemaRef,
+        vector_lengths: Vec<Option<i32>>,
+    ) -> Self {
         Self {
             writers,
             schema: arrow.clone(),
             buffered_rows: 0,
+            vector_lengths,
         }
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         self.buffered_rows += batch.num_rows();
+        let vector_lengths = &self.vector_lengths;
         let mut writers = self.writers.iter_mut();
-        for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
-            for leaf in compute_leaves(field.as_ref(), column)? {
+        for (idx, (field, column)) in self.schema.fields().iter().zip(batch.columns()).enumerate() {
+            let vector = vector_field_flatten(vector_lengths, idx, field)?;
+            for leaf in compute_leaves_with_options(field.as_ref(), column, vector)? {
                 writers.next().unwrap().write(&leaf)?;
             }
         }
@@ -1251,14 +1325,24 @@ impl ArrowRowGroupWriter {
         chunkers: &mut [ContentDefinedChunker],
     ) -> Result<()> {
         self.buffered_rows += batch.num_rows();
+        let vector_lengths = &self.vector_lengths;
         let mut writers = self.writers.iter_mut();
         let mut chunkers = chunkers.iter_mut();
-        for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
-            for leaf in compute_leaves(field.as_ref(), column)? {
-                writers
-                    .next()
-                    .unwrap()
-                    .write_with_chunker(&leaf, chunkers.next().unwrap())?;
+        for (idx, (field, column)) in self.schema.fields().iter().zip(batch.columns()).enumerate() {
+            // EXPERIMENTAL: content-defined chunking slices the flattened element
+            // stream at arbitrary offsets, which would split a vector value across
+            // pages (a VECTOR column has no levels to delimit records). Route
+            // VECTOR-encoded columns through the regular, vector-aligned write path
+            // instead; their (single) chunker is consumed but unused.
+            let is_vector = vector_field_flatten(vector_lengths, idx, field)?;
+            for leaf in compute_leaves_with_options(field.as_ref(), column, is_vector)? {
+                let writer = writers.next().unwrap();
+                let chunker = chunkers.next().unwrap();
+                if is_vector {
+                    writer.write(&leaf)?;
+                } else {
+                    writer.write_with_chunker(&leaf, chunker)?;
+                }
             }
         }
         Ok(())
@@ -1325,7 +1409,27 @@ impl ArrowRowGroupWriterFactory {
 
     fn create_row_group_writer(&self, row_group_index: usize) -> Result<ArrowRowGroupWriter> {
         let writers = self.create_column_writers(row_group_index)?;
-        Ok(ArrowRowGroupWriter::new(writers, &self.arrow_schema))
+        // Derive the per-field VECTOR length from the actual Parquet schema: a
+        // top-level field is flattened iff its Parquet root field is a VECTOR
+        // logical group whose middle `list` group carries vector_length. This
+        // stays correct even when an explicit (possibly non-VECTOR) schema is
+        // supplied alongside `vector_encoding`.
+        let vector_lengths = self
+            .schema
+            .root_schema()
+            .get_fields()
+            .iter()
+            .map(|f| vector_length_for_root_field(f.as_ref()))
+            .collect::<Vec<_>>();
+        // `vector_lengths` is indexed positionally by top-level Arrow field; this
+        // relies on the 1:1 correspondence between Arrow fields and Parquet root
+        // fields that the column-writer mapping also assumes.
+        debug_assert_eq!(vector_lengths.len(), self.arrow_schema.fields().len());
+        Ok(ArrowRowGroupWriter::new(
+            writers,
+            &self.arrow_schema,
+            vector_lengths,
+        ))
     }
 
     /// Create column writers for a new row group, with the given row group index
@@ -5471,6 +5575,1049 @@ mod tests {
             total_values as usize, num_rows,
             "expected every level position to be represented in some page"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // EXPERIMENTAL: canonical VECTOR logical/repetition type tests
+    // ------------------------------------------------------------------
+
+    /// Does the schema converter encode `field` as a Parquet VECTOR column when
+    /// vector encoding is enabled?
+    fn converts_to_vector(field: Field) -> bool {
+        let schema = Schema::new(vec![field]);
+        let descr = ArrowSchemaConverter::new()
+            .with_vector_encoding(true)
+            .convert(&schema)
+            .unwrap();
+        (0..descr.num_columns()).any(|i| descr.column(i).vector_length().is_some())
+    }
+
+    fn float_fsl(element_nullable: bool, size: i32) -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new("element", DataType::Float32, element_nullable)),
+            size,
+        )
+    }
+
+    #[test]
+    fn vector_encoding_eligibility() {
+        // Eligible: non-nullable FixedSizeList<Float32, 3> with non-nullable element.
+        assert!(converts_to_vector(Field::new(
+            "e",
+            float_fsl(false, 3),
+            false
+        )));
+
+        // Fixed-width decimal elements (all widths) are eligible.
+        for dt in [
+            DataType::Decimal32(9, 2),
+            DataType::Decimal64(18, 2),
+            DataType::Decimal128(38, 2),
+            DataType::Decimal256(76, 2),
+        ] {
+            let fsl = DataType::FixedSizeList(Arc::new(Field::new("element", dt, false)), 4);
+            assert!(converts_to_vector(Field::new("e", fsl, false)));
+        }
+
+        // Nullable outer list → fallback to LIST.
+        assert!(!converts_to_vector(Field::new(
+            "e",
+            float_fsl(false, 3),
+            true
+        )));
+        // Nullable element → fallback.
+        assert!(!converts_to_vector(Field::new(
+            "e",
+            float_fsl(true, 3),
+            false
+        )));
+        // Zero-length → fallback.
+        assert!(!converts_to_vector(Field::new(
+            "e",
+            float_fsl(false, 0),
+            false
+        )));
+        // Variable-width (Utf8) element → fallback.
+        let utf8_fsl =
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Utf8, false)), 3);
+        assert!(!converts_to_vector(Field::new("e", utf8_fsl, false)));
+        // Nested FixedSizeList (top-level is List) → inner FSL uses LIST.
+        let nested = DataType::List(Arc::new(Field::new("item", float_fsl(false, 3), false)));
+        assert!(!converts_to_vector(Field::new("e", nested, false)));
+    }
+
+    #[test]
+    #[cfg(feature = "arrow_canonical_extension_types")]
+    fn vector_encoding_uuid_self_describing_roundtrip() {
+        use arrow_schema::extension::Uuid;
+
+        let n = 2i32;
+        let rows = 3usize;
+        let raw: Vec<[u8; 16]> = (0..(rows * n as usize)).map(|i| [i as u8; 16]).collect();
+        let values =
+            Arc::new(FixedSizeBinaryArray::try_from_iter(raw.into_iter()).unwrap()) as ArrayRef;
+        let element = Arc::new(
+            Field::new("element", DataType::FixedSizeBinary(16), false).with_extension_type(Uuid),
+        );
+        let list = FixedSizeListArray::new(element, n, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ids",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        // skip_arrow_metadata=true forces self-describing reconstruction (no hint).
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        // Reading back must not error, and the UUID extension lands on the child.
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        assert_eq!(
+            builder
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .vector_length(),
+            Some(2)
+        );
+        let out_field = builder.schema().field(0).clone();
+        match out_field.data_type() {
+            DataType::FixedSizeList(child, 2) => {
+                assert!(!out_field.metadata().contains_key("ARROW:extension:name"));
+                assert_eq!(
+                    child
+                        .metadata()
+                        .get("ARROW:extension:name")
+                        .map(String::as_str),
+                    Some("arrow.uuid")
+                );
+            }
+            other => panic!("expected FixedSizeList(_, 2), got {other:?}"),
+        }
+        let mut reader = builder.build().unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "arrow_canonical_extension_types")]
+    fn vector_encoding_preserves_element_extension_metadata() {
+        use crate::basic::{LogicalType, Repetition};
+        use arrow_schema::extension::Uuid;
+
+        // A UUID extension on the FixedSizeBinary(16) element must survive into the
+        // VECTOR element leaf's logical type, matching the standard LIST encoding.
+        let element = Arc::new(
+            Field::new("element", DataType::FixedSizeBinary(16), false).with_extension_type(Uuid),
+        );
+        let schema = Schema::new(vec![Field::new(
+            "ids",
+            DataType::FixedSizeList(element, 2),
+            false,
+        )]);
+        let descr = ArrowSchemaConverter::new()
+            .with_vector_encoding(true)
+            .convert(&schema)
+            .unwrap();
+        let col = descr.column(0);
+        let root = descr.root_schema().get_fields()[0].as_ref();
+        assert_eq!(
+            root.get_basic_info().logical_type_ref(),
+            Some(&LogicalType::Vector)
+        );
+        let list = root.get_fields()[0].as_ref();
+        assert_eq!(list.get_basic_info().repetition(), Repetition::VECTOR);
+        assert_eq!(list.vector_length(), Some(2));
+        assert_eq!(col.vector_length(), Some(2));
+        assert_eq!(
+            col.self_type().get_basic_info().logical_type_ref(),
+            Some(&LogicalType::Uuid)
+        );
+    }
+
+    #[test]
+    fn vector_encoding_explicit_schema_length_mismatch_errors() {
+        use crate::basic::{LogicalType, Repetition, Type as PhysicalType};
+
+        // Arrow FixedSizeList<Float32, 3>.
+        let values = Arc::new(Float32Array::from(
+            (0..12).map(|v| v as f32).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, 3, values, None);
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        // Explicit Parquet schema declaring a *different* VECTOR length (2 vs 3).
+        let leaf = Arc::new(
+            Type::primitive_type_builder("element", PhysicalType::FLOAT)
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let list = Arc::new(
+            Type::group_type_builder("list")
+                .with_repetition(Repetition::VECTOR)
+                .with_vector_length(Some(2))
+                .with_fields(vec![leaf])
+                .build()
+                .unwrap(),
+        );
+        let vector = Arc::new(
+            Type::group_type_builder("embedding")
+                .with_repetition(Repetition::REQUIRED)
+                .with_logical_type(Some(LogicalType::Vector))
+                .with_fields(vec![list])
+                .build()
+                .unwrap(),
+        );
+        let root = Arc::new(
+            Type::group_type_builder("arrow_schema")
+                .with_fields(vec![vector])
+                .build()
+                .unwrap(),
+        );
+        let parquet_schema = SchemaDescriptor::new(root);
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_parquet_schema(parquet_schema)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), arrow_schema, options).unwrap();
+        let err = writer.write(&batch).unwrap_err();
+        assert!(
+            err.to_string().contains("vector_length 2") && err.to_string().contains("size 3"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_encoding_ignored_with_explicit_list_schema() {
+        // An explicit (non-VECTOR) Parquet schema must win over a stray
+        // `vector_encoding=true`: the writer must NOT flatten the FixedSizeList,
+        // otherwise it would feed a level-free leaf to a LIST column writer.
+        let flat: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        let values = Arc::new(Float32Array::from(flat.clone())) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, 3, values, None);
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        // Build a standard LIST Parquet schema (no vector encoding).
+        let parquet_schema = ArrowSchemaConverter::new().convert(&arrow_schema).unwrap();
+        assert!(parquet_schema.column(0).vector_length().is_none());
+
+        // Supply the explicit LIST schema but (incorrectly) also enable vector
+        // encoding via properties.
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_parquet_schema(parquet_schema)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), arrow_schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        // No VECTOR column: the explicit LIST schema was honored.
+        assert!(
+            builder
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .vector_length()
+                .is_none()
+        );
+        // And the data reads back intact (as a 3-level list).
+        let reader = builder.build().unwrap();
+        let mut total = 0usize;
+        for b in reader {
+            total += b.unwrap().num_rows();
+        }
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn vector_encoding_disabled_by_default() {
+        let schema = Schema::new(vec![Field::new("e", float_fsl(false, 3), false)]);
+        let descr = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        assert!(!(0..descr.num_columns()).any(|i| descr.column(i).vector_length().is_some()));
+    }
+
+    #[test]
+    fn vector_encoding_roundtrip_self_describing() {
+        use crate::basic::{LogicalType, Repetition};
+
+        let flat: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        let values = Arc::new(Float32Array::from(flat.clone())) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, 3, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        // skip_arrow_metadata=true proves the FixedSizeList is recovered from the
+        // Parquet schema alone, without the embedded ARROW:schema hint.
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), schema.clone(), options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+
+        // The Parquet schema carries the VECTOR repetition and vector_length.
+        let descr = builder.metadata().file_metadata().schema_descr();
+        assert_eq!(descr.num_columns(), 1);
+        let col = descr.column(0);
+        let root = descr.root_schema().get_fields()[0].as_ref();
+        assert_eq!(
+            root.get_basic_info().logical_type_ref(),
+            Some(&LogicalType::Vector)
+        );
+        let list = root.get_fields()[0].as_ref();
+        assert_eq!(list.get_basic_info().repetition(), Repetition::VECTOR);
+        assert_eq!(list.vector_length(), Some(3));
+        assert_eq!(col.vector_length(), Some(3));
+
+        // num_values == rows * N, num_rows == rows.
+        let rg = builder.metadata().row_group(0);
+        assert_eq!(rg.num_rows(), 4);
+        assert_eq!(rg.column(0).num_values(), 12);
+
+        // The Arrow schema is recovered as a non-nullable FixedSizeList.
+        let out_field = builder.schema().field(0).clone();
+        assert!(!out_field.is_nullable());
+        assert_eq!(
+            out_field.data_type(),
+            &DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Float32, false)), 3)
+        );
+
+        let mut reader = builder.build().unwrap();
+        let out = reader.next().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 4);
+        let out_list = out.column(0).as_fixed_size_list();
+        assert_eq!(out_list.value_length(), 3);
+        assert_eq!(out_list.null_count(), 0);
+        let recovered = out_list.values().as_primitive::<Float32Type>();
+        assert_eq!(recovered.values(), &flat[..]);
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn vector_encoding_roundtrip_with_arrow_schema_hint() {
+        // Same as the self-describing test but keeping the embedded ARROW:schema
+        // hint (the default). The reconstruction must still produce a
+        // FixedSizeList and round-trip the data, across multiple batches/row
+        // groups.
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let make_batch = |start: i32, rows: usize| {
+            let flat: Vec<f32> = (0..(rows as i32 * 3)).map(|v| (start + v) as f32).collect();
+            let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+            let list = FixedSizeListArray::new(element.clone(), 3, values, None);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "embedding",
+                list.data_type().clone(),
+                false,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap()
+        };
+
+        let b0 = make_batch(0, 4);
+        let b1 = make_batch(100, 2);
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let options = ArrowWriterOptions::new().with_properties(props);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), b0.schema(), options).unwrap();
+        writer.write(&b0).unwrap();
+        writer.write(&b1).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        // Even with the hint present, the leaf is VECTOR-encoded.
+        assert_eq!(
+            builder
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .num_columns(),
+            1
+        );
+        assert_eq!(
+            builder
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .vector_length(),
+            Some(3)
+        );
+        let out_field = builder.schema().field(0).clone();
+        assert!(matches!(
+            out_field.data_type(),
+            DataType::FixedSizeList(_, 3)
+        ));
+
+        let reader = builder.build().unwrap();
+        let mut all = Vec::new();
+        let mut rows = 0;
+        for b in reader {
+            let b = b.unwrap();
+            rows += b.num_rows();
+            let list = b.column(0).as_fixed_size_list();
+            let flat = list.values().as_primitive::<Float32Type>();
+            all.extend_from_slice(flat.values());
+        }
+        assert_eq!(rows, 6);
+        let mut expected: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        expected.extend((0..6).map(|v| (100 + v) as f32));
+        assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn vector_encoding_roundtrip_sliced_array() {
+        // A sliced FixedSizeListArray has a non-zero offset; the write path must
+        // slice the child by `offset * size` to emit the correct logical range.
+        let n = 3i32;
+        let total_rows = 6usize;
+        let values = Arc::new(Float32Array::from(
+            (0..(total_rows as i32 * n))
+                .map(|v| v as f32)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let full = FixedSizeListArray::new(
+            Arc::new(Field::new("element", DataType::Float32, false)),
+            n,
+            values,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            full.data_type().clone(),
+            false,
+        )]));
+        let full_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(full)]).unwrap();
+        // Rows 2..5 (offset 2, len 3).
+        let batch = full_batch.slice(2, 3);
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        assert_eq!(builder.metadata().row_group(0).num_rows(), 3);
+        assert_eq!(builder.metadata().row_group(0).column(0).num_values(), 9);
+        let mut reader = builder.build().unwrap();
+        let out = reader.next().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 3);
+        let list = out.column(0).as_fixed_size_list();
+        // rows 2,3,4 → element values 6..15
+        assert_eq!(
+            list.values().as_primitive::<Float32Type>().values(),
+            &(6..15).map(|v| v as f32).collect::<Vec<_>>()[..]
+        );
+    }
+
+    #[test]
+    fn vector_encoding_read_under_row_filter() {
+        use crate::arrow::ProjectionMask;
+        use crate::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+
+        // Predicate pushdown drives the row-group cache and the VECTOR reader's
+        // skip/read accounting (the CachedArrayReader wraps the reshape wrapper).
+        let n = 3i32;
+        let num_rows = 200usize;
+        let ids = Arc::new(Int32Array::from((0..num_rows as i32).collect::<Vec<_>>())) as ArrayRef;
+        let emb_values = Arc::new(Float32Array::from(
+            (0..(num_rows as i32 * n))
+                .map(|v| v as f32)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let emb = FixedSizeListArray::new(
+            Arc::new(Field::new("element", DataType::Float32, false)),
+            n,
+            emb_values,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("embedding", emb.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, Arc::new(emb)]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(256)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        let schema_desc = builder.metadata().file_metadata().schema_descr_ptr();
+        // Predicate on `id` (leaf 0): id >= 100.
+        let projection = ProjectionMask::leaves(&schema_desc, [0]);
+        let predicate = ArrowPredicateFn::new(projection, |batch: RecordBatch| {
+            let ids = batch.column(0);
+            arrow::compute::kernels::cmp::gt_eq(ids, &Int32Array::new_scalar(100))
+        });
+        let filter = RowFilter::new(vec![Box::new(predicate)]);
+        let reader = builder.with_row_filter(filter).build().unwrap();
+
+        let mut ids_out = Vec::new();
+        let mut emb_out = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            ids_out.extend_from_slice(b.column(0).as_primitive::<Int32Type>().values());
+            let emb = b.column(1).as_fixed_size_list();
+            assert_eq!(emb.value_length(), 3);
+            emb_out.extend_from_slice(emb.values().as_primitive::<Float32Type>().values());
+        }
+        // Rows 100..200 survive the filter.
+        assert_eq!(ids_out, (100..200).collect::<Vec<i32>>());
+        let expected_emb: Vec<f32> = ((100 * n as usize)..(num_rows * n as usize))
+            .map(|v| v as f32)
+            .collect();
+        assert_eq!(emb_out, expected_emb);
+    }
+
+    #[test]
+    fn vector_encoding_mixed_with_scalar_column() {
+        // A VECTOR column and a scalar column in one row group must agree on the
+        // logical row count (VECTOR rows = values/N, scalar rows = values). The
+        // writer cross-checks this, so a wrong row count would fail the write.
+        let n = 3i32;
+        let num_rows = 100usize;
+        let emb_values = Arc::new(Float32Array::from(
+            (0..(num_rows as i32 * n))
+                .map(|v| v as f32)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let emb = FixedSizeListArray::new(
+            Arc::new(Field::new("element", DataType::Float32, false)),
+            n,
+            emb_values,
+            None,
+        );
+        let ids = Arc::new(Int32Array::from((0..num_rows as i32).collect::<Vec<_>>())) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("embedding", emb.data_type().clone(), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(emb), ids]).unwrap();
+
+        // Small pages so each column spans several pages.
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(256)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        let md = builder.metadata().clone();
+        assert_eq!(md.row_group(0).num_rows(), num_rows as i64);
+        let descr = md.file_metadata().schema_descr();
+        assert_eq!(descr.column(0).vector_length(), Some(3));
+        assert!(descr.column(1).vector_length().is_none());
+        // VECTOR column chunk holds num_rows*n values; scalar column holds num_rows.
+        assert_eq!(md.row_group(0).column(0).num_values(), num_rows as i64 * 3);
+        assert_eq!(md.row_group(0).column(1).num_values(), num_rows as i64);
+
+        let reader = builder.build().unwrap();
+        let mut rows = 0usize;
+        let mut ids_out = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            rows += b.num_rows();
+            assert_eq!(b.column(0).as_fixed_size_list().value_length(), 3);
+            ids_out.extend_from_slice(b.column(1).as_primitive::<Int32Type>().values());
+        }
+        assert_eq!(rows, num_rows);
+        assert_eq!(ids_out, (0..num_rows as i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn vector_encoding_roundtrip_decimal_and_fixed_size_binary() {
+        // Exercise element types whose Parquet physical mapping differs from FLOAT:
+        // Decimal128(38,5) → FLBA(16), and a plain FixedSizeBinary(4) → FLBA(4).
+        let dec_in: Vec<i128> = (0..6).collect();
+        let dec_values = Decimal128Array::from(dec_in.clone())
+            .with_precision_and_scale(38, 5)
+            .unwrap();
+        let dec_list = FixedSizeListArray::new(
+            Arc::new(Field::new("element", DataType::Decimal128(38, 5), false)),
+            2,
+            Arc::new(dec_values) as ArrayRef,
+            None,
+        );
+
+        let raw: Vec<[u8; 4]> = (0..6).map(|i| [i as u8; 4]).collect();
+        let bin_values = FixedSizeBinaryArray::try_from_iter(raw.into_iter()).unwrap();
+        let bin_list = FixedSizeListArray::new(
+            Arc::new(Field::new("element", DataType::FixedSizeBinary(4), false)),
+            2,
+            Arc::new(bin_values) as ArrayRef,
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("dec", dec_list.data_type().clone(), false),
+            Field::new("bin", bin_list.data_type().clone(), false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dec_list), Arc::new(bin_list)])
+                .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        let descr = builder.metadata().file_metadata().schema_descr();
+        assert_eq!(descr.column(0).vector_length(), Some(2));
+        assert_eq!(descr.column(1).vector_length(), Some(2));
+
+        let mut reader = builder.build().unwrap();
+        let out = reader.next().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 3);
+
+        let dec_out = out.column(0).as_fixed_size_list();
+        assert_eq!(dec_out.value_length(), 2);
+        assert_eq!(
+            dec_out.values().as_primitive::<Decimal128Type>().values(),
+            &dec_in[..]
+        );
+        assert_eq!(dec_out.values().data_type(), &DataType::Decimal128(38, 5));
+
+        let bin_out = out.column(1).as_fixed_size_list();
+        assert_eq!(bin_out.value_length(), 2);
+        let bin_inner = bin_out
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(bin_inner.value(0), [0u8; 4]);
+        assert_eq!(bin_inner.value(5), [5u8; 4]);
+    }
+
+    #[test]
+    fn vector_encoding_pages_aligned_to_whole_vectors() {
+        let n: i32 = 5;
+        let num_rows = 1000usize;
+        let total = num_rows * n as usize;
+        let flat: Vec<f32> = (0..total).map(|v| v as f32).collect();
+        let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, n, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        // Small page size + a write batch size that is not a multiple of N, to
+        // force many pages and exercise the vector-boundary alignment.
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(256)
+            .set_write_batch_size(13)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), schema.clone(), options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let mut metadata = ParquetMetaDataReader::new();
+        metadata.try_parse(&data).unwrap();
+        let metadata = metadata.finish().unwrap();
+        let rg = metadata.row_group(0);
+        assert_eq!(rg.num_rows() as usize, num_rows);
+        let col_meta = rg.column(0);
+        assert_eq!(col_meta.num_values() as usize, total);
+
+        // Every data page must end on a whole-vector boundary.
+        let mut reader =
+            SerializedPageReader::new(Arc::new(data.clone()), col_meta, num_rows, None).unwrap();
+        let mut data_pages = 0;
+        while let Some(page) = reader.get_next_page().unwrap() {
+            if matches!(page, Page::DataPage { .. } | Page::DataPageV2 { .. }) {
+                assert_eq!(
+                    page.num_values() as usize % n as usize,
+                    0,
+                    "a data page split a vector value"
+                );
+                data_pages += 1;
+            }
+        }
+        assert!(
+            data_pages > 1,
+            "expected multiple data pages, got {data_pages}"
+        );
+
+        // And the data round-trips correctly.
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        let reader = builder.build().unwrap();
+        let mut seen = 0usize;
+        for b in reader {
+            seen += b.unwrap().num_rows();
+        }
+        assert_eq!(seen, num_rows);
+    }
+
+    #[test]
+    fn vector_encoding_interleaved_row_selection() {
+        use crate::arrow::arrow_reader::{RowSelection, RowSelectionPolicy, RowSelector};
+
+        // A selection that interleaves select/skip/select within one output batch
+        // exercises the `Selectors` path, where read_records and skip_records run
+        // before a single terminal consume_batch. A skip that flushed the inner
+        // buffer would drop the previously-selected rows.
+        let n = 3i32;
+        let num_rows = 100usize;
+        let emb_values = Arc::new(Float32Array::from(
+            (0..(num_rows as i32 * n))
+                .map(|v| v as f32)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let emb = FixedSizeListArray::new(
+            Arc::new(Field::new("element", DataType::Float32, false)),
+            n,
+            emb_values,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            emb.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(emb)]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        // Select rows 0..30 and 50..80.
+        let selection = RowSelection::from(vec![
+            RowSelector::select(30),
+            RowSelector::skip(20),
+            RowSelector::select(30),
+            RowSelector::skip(20),
+        ]);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data)
+            .unwrap()
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .with_row_selection(selection);
+        let reader = builder.build().unwrap();
+        let mut got = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            got.extend_from_slice(
+                b.column(0)
+                    .as_fixed_size_list()
+                    .values()
+                    .as_primitive::<Float32Type>()
+                    .values(),
+            );
+        }
+        let mut expected: Vec<f32> = (0..(30 * n as usize)).map(|v| v as f32).collect();
+        expected.extend(((50 * n as usize)..(80 * n as usize)).map(|v| v as f32));
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn vector_encoding_v2_page_skip_with_row_selection() {
+        use crate::arrow::arrow_reader::{RowSelection, RowSelector};
+        use crate::file::properties::WriterVersion;
+
+        let n: i32 = 4;
+        let num_rows = 500usize;
+        let total = num_rows * n as usize;
+        let flat: Vec<f32> = (0..total).map(|v| v as f32).collect();
+        let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, n, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        // DataPageV2 + small pages so a row selection skips across page
+        // boundaries, exercising the VECTOR skip path (whose V2 page num_rows is
+        // logical-rows, not flat values).
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(512)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), schema.clone(), options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        // Skip the first 250 rows, select the next 250.
+        let selection = RowSelection::from(vec![RowSelector::skip(250), RowSelector::select(250)]);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data)
+            .unwrap()
+            .with_row_selection(selection);
+        let reader = builder.build().unwrap();
+        let mut got = Vec::new();
+        let mut rows = 0usize;
+        for b in reader {
+            let b = b.unwrap();
+            rows += b.num_rows();
+            let list = b.column(0).as_fixed_size_list();
+            let fv = list.values().as_primitive::<Float32Type>();
+            got.extend_from_slice(fv.values());
+        }
+        assert_eq!(rows, 250);
+        // Rows 250..500 → element values 1000..2000.
+        let expected: Vec<f32> = ((250 * n as usize)..total).map(|v| v as f32).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn vector_encoding_rejected_by_record_row_api() {
+        use crate::file::reader::{FileReader, SerializedFileReader};
+
+        let values = Arc::new(Float32Array::from(
+            (0..6).map(|v| v as f32).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, 3, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer = ArrowWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        // The legacy row-based record API must reject VECTOR columns rather than
+        // silently reading one element per row.
+        let reader = SerializedFileReader::new(data).unwrap();
+        let result = reader
+            .get_row_iter(None)
+            .and_then(|mut it| match it.next() {
+                Some(row) => row.map(|_| ()),
+                None => Ok(()),
+            });
+        let err = result.expect_err("record row API should reject VECTOR columns");
+        assert!(
+            err.to_string().contains("VECTOR"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_encoding_pages_aligned_with_dictionary() {
+        // Like vector_encoding_pages_aligned_to_whole_vectors but with dictionary
+        // encoding ENABLED, covering the dict-fallback page path.
+        let n: i32 = 5;
+        let num_rows = 1000usize;
+        let total = num_rows * n as usize;
+        // Low cardinality so dictionary encoding is used.
+        let flat: Vec<f32> = (0..total).map(|v| (v % 7) as f32).collect();
+        let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, n, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            // dictionary encoding left enabled (the default)
+            .set_data_page_size_limit(256)
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), schema.clone(), options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let mut metadata = ParquetMetaDataReader::new();
+        metadata.try_parse(&data).unwrap();
+        let metadata = metadata.finish().unwrap();
+        let col_meta = metadata.row_group(0).column(0);
+        let mut reader =
+            SerializedPageReader::new(Arc::new(data.clone()), col_meta, num_rows, None).unwrap();
+        let mut data_pages = 0;
+        while let Some(page) = reader.get_next_page().unwrap() {
+            if matches!(page, Page::DataPage { .. } | Page::DataPageV2 { .. }) {
+                assert_eq!(
+                    page.num_values() as usize % n as usize,
+                    0,
+                    "dictionary path split a vector value across a data page"
+                );
+                data_pages += 1;
+            }
+        }
+        assert!(
+            data_pages > 1,
+            "expected multiple data pages, got {data_pages}"
+        );
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        let reader = builder.build().unwrap();
+        let mut rows = 0usize;
+        for b in reader {
+            rows += b.unwrap().num_rows();
+        }
+        assert_eq!(rows, num_rows);
+    }
+
+    #[test]
+    fn vector_encoding_with_content_defined_chunking_keeps_vectors_whole() {
+        use crate::file::properties::CdcOptions;
+
+        // Content-defined chunking must not split a vector across pages: VECTOR
+        // columns are routed through the regular vector-aligned write path.
+        let n: i32 = 5;
+        let num_rows = 2000usize;
+        let total = num_rows * n as usize;
+        let flat: Vec<f32> = (0..total).map(|v| v as f32).collect();
+        let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let list = FixedSizeListArray::new(element, n, values, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_vector_encoding(true)
+            .set_dictionary_enabled(false)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 512,
+                norm_level: 0,
+            }))
+            .build();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut writer =
+            ArrowWriter::try_new_with_options(Vec::new(), schema.clone(), options).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let mut metadata = ParquetMetaDataReader::new();
+        metadata.try_parse(&data).unwrap();
+        let metadata = metadata.finish().unwrap();
+        let rg = metadata.row_group(0);
+        assert_eq!(rg.num_rows() as usize, num_rows);
+        let col_meta = rg.column(0);
+        assert_eq!(col_meta.num_values() as usize, total);
+
+        let mut reader =
+            SerializedPageReader::new(Arc::new(data.clone()), col_meta, num_rows, None).unwrap();
+        while let Some(page) = reader.get_next_page().unwrap() {
+            if matches!(page, Page::DataPage { .. } | Page::DataPageV2 { .. }) {
+                assert_eq!(
+                    page.num_values() as usize % n as usize,
+                    0,
+                    "CDC split a vector value across a data page"
+                );
+            }
+        }
+
+        // Data round-trips correctly.
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+        let reader = builder.build().unwrap();
+        let mut seen = 0usize;
+        for b in reader {
+            seen += b.unwrap().num_rows();
+        }
+        assert_eq!(seen, num_rows);
     }
 
     struct WriteBatchesShape {

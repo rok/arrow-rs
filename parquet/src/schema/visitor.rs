@@ -53,10 +53,7 @@ pub trait TypeVisitor<R, C> {
             Type::PrimitiveType { .. } => {
                 panic!("{list_type:?} is a list type and must be a group type")
             }
-            Type::GroupType {
-                basic_info: _,
-                fields,
-            } if fields.len() == 1 => {
+            Type::GroupType { fields, .. } if fields.len() == 1 => {
                 let list_item = fields.first().unwrap();
 
                 match list_item.as_ref() {
@@ -69,10 +66,7 @@ pub trait TypeVisitor<R, C> {
                             ))
                         }
                     }
-                    Type::GroupType {
-                        basic_info: _,
-                        fields,
-                    } => {
+                    Type::GroupType { fields, .. } => {
                         if fields.len() == 1
                             && list_item.name() != "array"
                             && list_item.name() != format!("{}_tuple", list_type.name())

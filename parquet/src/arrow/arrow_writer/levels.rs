@@ -40,6 +40,7 @@
 //!
 //! \[1\] [parquet-format#nested-encoding](https://github.com/apache/parquet-format#nested-encoding)
 
+use crate::arrow::schema::vector_eligible_fixed_size_list;
 use crate::column::chunker::CdcChunk;
 use crate::column::writer::LevelDataRef;
 use crate::errors::{ParquetError, Result};
@@ -75,8 +76,86 @@ fn expand_typed_ree<R: RunEndIndexType>(run_array: &RunArray<R>) -> Result<Array
 }
 
 /// Performs a depth-first scan of the children of `array`, constructing [`ArrayLevels`]
-/// for each leaf column encountered
+/// for each leaf column encountered.
+///
+/// When `vector_encoding` is set and `field` is a top-level VECTOR-eligible
+/// `FixedSizeList`, the list is flattened into a single level-free element leaf
+/// of `rows * size` values, matching the canonical `VECTOR` schema produced by
+/// the schema converter. Nested `FixedSizeList`s are never flattened.
+#[cfg(test)]
 pub(crate) fn calculate_array_levels(array: &ArrayRef, field: &Field) -> Result<Vec<ArrayLevels>> {
+    calculate_array_levels_with_options(array, field, false)
+}
+
+/// Like `calculate_array_levels`, with `vector_encoding` selecting whether an
+/// eligible top-level `FixedSizeList` is flattened into a Parquet `VECTOR` column.
+pub(crate) fn calculate_array_levels_with_options(
+    array: &ArrayRef,
+    field: &Field,
+    vector_encoding: bool,
+) -> Result<Vec<ArrayLevels>> {
+    if vector_encoding {
+        if let Some((element, size)) = vector_eligible_fixed_size_list(field) {
+            match array.data_type() {
+                DataType::FixedSizeList(array_element, array_size)
+                    if *array_size == size
+                        && element
+                            .data_type()
+                            .equals_datatype(array_element.data_type()) => {}
+                _ => {
+                    return Err(arrow_err!(
+                        "Incompatible type. Field '{}' has type {}, array has type {}",
+                        field.name(),
+                        field.data_type(),
+                        array.data_type()
+                    ));
+                }
+            }
+
+            let list = array.as_fixed_size_list();
+            if list.null_count() != 0 {
+                return Err(arrow_err!(
+                    "VECTOR column '{}' contains {} null vector values; VECTOR requires dense non-null FixedSizeList values",
+                    field.name(),
+                    list.null_count()
+                ));
+            }
+
+            let size = size as usize;
+            let offset = list.offset().checked_mul(size).ok_or_else(|| {
+                arrow_err!(
+                    "VECTOR column '{}' offset {} * vector_length {} overflows usize",
+                    field.name(),
+                    list.offset(),
+                    size
+                )
+            })?;
+            let len = list.len().checked_mul(size).ok_or_else(|| {
+                arrow_err!(
+                    "VECTOR column '{}' length {} * vector_length {} overflows usize",
+                    field.name(),
+                    list.len(),
+                    size
+                )
+            })?;
+
+            // Slice the child to this array's logical range, then emit the flat
+            // element values with no definition or repetition levels.
+            let values = list.values().slice(offset, len);
+            if values.null_count() != 0 {
+                return Err(arrow_err!(
+                    "VECTOR column '{}' contains {} null element values; VECTOR requires dense non-null elements",
+                    field.name(),
+                    values.null_count()
+                ));
+            }
+
+            let mut builder =
+                LevelInfoBuilder::try_new(element.as_ref(), Default::default(), &values)?;
+            builder.write(0..values.len());
+            return Ok(builder.finish());
+        }
+    }
     let mut builder = LevelInfoBuilder::try_new(field, Default::default(), array)?;
     builder.write(0..array.len());
     Ok(builder.finish())
@@ -2540,6 +2619,94 @@ mod tests {
         assert_eq!(
             err,
             "Arrow: Incompatible type. Field 'item' has type Float64, array has type Int32",
+        );
+    }
+
+    #[test]
+    fn vector_encoding_mismatched_array_type_errors() {
+        let field = Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Float32, false)), 2),
+            false,
+        );
+        let array = Arc::new(Int32Array::from_iter(0..4)) as ArrayRef;
+
+        let err = calculate_array_levels_with_options(&array, &field, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Incompatible type") && err.contains("array has type Int32"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_encoding_mismatched_list_size_errors() {
+        let field = Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Float32, false)), 2),
+            false,
+        );
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let values = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])) as ArrayRef;
+        let array = Arc::new(FixedSizeListArray::new(element, 3, values, None)) as ArrayRef;
+
+        let err = calculate_array_levels_with_options(&array, &field, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Incompatible type") && err.contains("FixedSizeList"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_encoding_rejects_null_vector_values() {
+        let element = Arc::new(Field::new("element", DataType::Float32, false));
+        let values = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])) as ArrayRef;
+        let array = Arc::new(FixedSizeListArray::new(
+            element,
+            2,
+            values,
+            Some(NullBuffer::from(vec![true, false])),
+        )) as ArrayRef;
+        let field = Field::new("embedding", array.data_type().clone(), false);
+
+        let err = calculate_array_levels_with_options(&array, &field, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("null vector values"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_encoding_rejects_null_element_values() {
+        // Build an array whose child permits nulls, but pass the writer a
+        // non-nullable VECTOR-eligible field. This mirrors the writer's runtime
+        // guard: field nullability alone must not cause null element values to be
+        // flattened as valid VECTOR data.
+        let array_element = Arc::new(Field::new("element", DataType::Float32, true));
+        let values = Arc::new(Float32Array::from(vec![
+            Some(1.0),
+            None,
+            Some(3.0),
+            Some(4.0),
+        ])) as ArrayRef;
+        let array = Arc::new(FixedSizeListArray::new(array_element, 2, values, None)) as ArrayRef;
+        let field = Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Float32, false)), 2),
+            false,
+        );
+
+        let err = calculate_array_levels_with_options(&array, &field, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("null element values"),
+            "unexpected error: {err}"
         );
     }
 
